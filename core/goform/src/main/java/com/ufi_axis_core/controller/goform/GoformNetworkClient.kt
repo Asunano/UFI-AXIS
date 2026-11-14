@@ -2,6 +2,8 @@ package com.ufi_axis_core.controller.goform
 
 import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.SettingKey
+import com.ufi_axis_core.devicespi.WriteOutcome
+import com.ufi_axis_core.util.AppLogger
 
 
 
@@ -16,31 +18,49 @@ import com.ufi_axis_core.deviceschema.SettingKey
  * - 流量限额设置/校准
  * - APN 配置管理
  * - 漫游设置
+ *
+ * @param commandProfile 命令表来源，**非空**；由装配层传选中插件的 profile
+ *
+ * ## 为什么本类**不收**可空 `profile`（阶段 2 批 D1 裁决）
+ *
+ * 本类**目前没有读侧归一化路径** —— 它不持有 [GoformFieldMapper]，所有方法都是写操作。
+ * 可空 `profile` 的唯一语义是「排障开关关掉了字段归一化」，而那件事在本类里无从生效；
+ * 留一个没人用的可空参数只会让下一个人以为「字段归一化在这三个纯写客户端里生效」（错的）。
+ *
+ * **将来本类长出读侧字段时**（比如 APN 列表回读要归一化），按 [GoformSignalClient] 的形状
+ * 把可空 `profile` 加回来 —— 可空那份管归一化、非空那份管命令表，两份都要。
+ *
+ * [commandProfile]（**非空**）只喂**命令表** —— 写命令的 goformId、参数键、
+ * 以及写命令的**参数值域**（[lteAllBands] / [nrAllBands] 的频段全集就是这一类）。
+ * 字段归一化可以关，命令表不能关。所以它**没有默认值**：默认值等于把选型逻辑散进每个
+ * 客户端的签名，换设备要改 N 处且漏一处不报错（同一条判据见 `DeviceRuntime.commandProfile`）。
  */
 class GoformNetworkClient(
-    private val client: GoformClient,
-    profile: DeviceProfile?,
+    private val client: GoformTransport,
+    private val commandProfile: DeviceProfile,
 ) {
-    private val writer = GoformSettingWriter(client, profile)
+
+    // 写路径吃的是**命令表**那一份（非空）：排障开关不该改变「往设备发什么命令」，
+    // 这是阶段 2 批 D1 修掉的 P1-31（原来传的是可空 profile，writer 内部 `?: ZteGoformProfile` 兜底）。
+    private val writer = GoformSettingWriter(client, commandProfile)
 
 
-    companion object {
-        /** ZTE MU300 全 LTE 频段（解锁时使用） */
-        const val LTE_ALL_BANDS = "1,3,5,8,34,38,39,40,41"
-        /** ZTE MU300 全 NR 频段（解锁时使用） */
-        const val NR_ALL_BANDS = "1,5,8,28,41,78"
+    private companion object {
+        const val TAG = "GoformNetwork"
     }
+
 
     // ==================== 移动数据 ====================
 
-    suspend fun setMobileData(enabled: Boolean): Boolean {
-        val primaryId = if (enabled) "CONNECT_NETWORK" else "DISCONNECT_NETWORK"
-        if (client.isGoformSuccess(client.goformPost(mapOf("isTest" to "false", "notCallback" to "true", "goformId" to primaryId)))) return true
-        return client.isGoformSuccess(client.goformPost(mapOf(
-            "isTest" to "false", "goformId" to "SET_DATA_ENABLED",
-            "data" to if (enabled) "1" else "0"
-        )))
-    }
+    /**
+     * 开关移动数据。
+     *
+     * 两件设备事实都在 [SettingKey.MOBILE_DATA] 的 WriteSpec 里：开/关是两条不同的 goformId
+     * （`commandOf`），主命令不成功还要发一条 `SET_DATA_ENABLED` 兜底（`fallback`）。
+     * 所以这里没有 if —— 兜底的触发条件覆盖「非 Ok 的全部分支」，与改造前「第一条返回
+     * 不成功或 null 就发第二条」等价（见 [GoformSettingWriter.writeChecked]）。
+     */
+    suspend fun setMobileData(enabled: Boolean): Boolean = writer.write(SettingKey.MOBILE_DATA, enabled)
 
     // ==================== 承载/连接 ====================
 
@@ -58,24 +78,21 @@ class GoformNetworkClient(
     suspend fun setBearerPreference(preference: String): WriteOutcome =
         writer.writeChecked(SettingKey.NETWORK_MODE, preference)
 
-    suspend fun connectNetwork(): Boolean {
-        return client.isGoformSuccess(client.goformPost(mapOf(
-            "isTest" to "false", "notCallback" to "true", "goformId" to "CONNECT_NETWORK"
-        )))
-    }
+    /**
+     * 手动拨号。
+     *
+     * 走 [SettingKey.PPP_DIAL] 而不是 [SettingKey.MOBILE_DATA]：命令名与参数完全相同，
+     * 但这一项**没有 `SET_DATA_ENABLED` 兜底** —— 现状这两个入口失败就是失败。
+     * 合并进 MOBILE_DATA 等于给它们偷偷加一条从来没发过的命令（会额外改一次数据开关）。
+     */
+    suspend fun connectNetwork(): Boolean = writer.write(SettingKey.PPP_DIAL, true)
 
-    suspend fun disconnectNetwork(): Boolean {
-        return client.isGoformSuccess(client.goformPost(mapOf(
-            "isTest" to "false", "notCallback" to "true", "goformId" to "DISCONNECT_NETWORK"
-        )))
-    }
+    /** 挂断。与 [connectNetwork] 同一个 key，由 `commandOf` 按取值选 `DISCONNECT_NETWORK`。 */
+    suspend fun disconnectNetwork(): Boolean = writer.write(SettingKey.PPP_DIAL, false)
 
-    suspend fun setConnectionMode(mode: String): Boolean {
-        return client.isGoformSuccess(client.goformPost(mapOf(
-            "isTest" to "false", "goformId" to "SET_CONNECTION_MODE",
-            "ConnectionMode" to mode
-        )))
-    }
+    /** @param mode 设备侧原值 `auto_dial` / `manual_dial`（取值域校验在 profile 的 validate 里）。 */
+    suspend fun setConnectionMode(mode: String): Boolean =
+        writer.write(SettingKey.CONNECTION_MODE, mode)
 
     // ==================== 频段锁定 ====================
 
@@ -89,10 +106,44 @@ class GoformNetworkClient(
         writer.writeChecked(SettingKey.BAND_LOCK_NR, bands)
 
 
+    /**
+     * 「解锁全部 LTE 频段」时要下发的取值。
+     *
+     * 值来自 [commandProfile]（命令表那一份，非空）—— 频段全集是 `LTE_BAND_LOCK` 这条
+     * **写命令的参数值域**，属于命令表范畴：字段归一化可以关，命令表不能关。
+     *
+     * ## profile 没给掩码（`null`）时返回空串
+     *
+     * 空串在设备侧就是「不发限制」（`ZteGoformProfile.validateBandList` 把空串当解锁放过，
+     * `encode` 原样发 `lte_band_lock=`）—— 与「空串 = 不发限制」**同一侧**，
+     * 也就是「不下发该 RAT 的全集」。刻意**不**抛异常（用户点一下「解锁」不该崩在写路径上），
+     * 也刻意**不**把 `null` 当成「有全集」去发一个空串冒充全集 —— 那两件事语义不同，
+     * 所以这里必须留一行 WARN（见 [DeviceProfile.lteAllBandsMask] 的 KDoc）。
+     *
+     * 给 `NetworkController` 用的也是这两个方法：跨模块直读 companion 常量已经删掉
+     * （计划书 §15 的 P0-1 / 任务 2.9）。
+     */
+    fun lteAllBands(): String = allBandsOf(commandProfile.lteAllBandsMask(), "LTE")
+
+    /** 「解锁全部 NR 频段」时要下发的取值。语义同 [lteAllBands]。 */
+    fun nrAllBands(): String = allBandsOf(commandProfile.nrAllBandsMask(), "NR")
+
+    private fun allBandsOf(mask: String?, rat: String): String {
+        if (mask == null) {
+            AppLogger.w(
+                TAG,
+                "${commandProfile.id} 未提供 $rat 频段全集掩码，本次「解锁全部频段」不下发 $rat 全集" +
+                    "（按空串 = 不发限制处理）"
+            )
+            return ""
+        }
+        return mask
+    }
+
     /** 解锁全部频段 = 设置为全量频段列表 */
     suspend fun unlockAllBands(): Boolean {
-        val lteOk = lockLteBands(LTE_ALL_BANDS).ok
-        val nrOk = lockNrBands(NR_ALL_BANDS).ok
+        val lteOk = lockLteBands(lteAllBands()).ok
+        val nrOk = lockNrBands(nrAllBands()).ok
         return lteOk && nrOk
     }
 
