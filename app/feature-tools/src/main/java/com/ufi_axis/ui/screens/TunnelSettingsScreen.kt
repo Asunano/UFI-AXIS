@@ -4,6 +4,9 @@ package com.ufi_axis.ui.screens
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -44,15 +47,26 @@ import kotlinx.coroutines.delay
 @Composable
 fun TunnelSettingsScreen(viewModel: MainViewModel, navController: NavHostController) {
     val state by viewModel.tunnelState.collectAsState()
-    val context = LocalContext.current
     val palette = LocalResolvedPalette.current
+    val context = LocalContext.current
     var toastMessage by remember { mutableStateOf<ToastMessage?>(null) }
     var showClearLogDialog by remember { mutableStateOf(false) }
     var pendingUninstall by remember { mutableStateOf<String?>(null) }
 
-    // 设置以后端 AppSettings 为准，进页面拉一次（否则显示的可能是上一次会话的默认值）
-    // 组件列表也在这里"直接加载"：core 侧 refresh=false 只读本地安装状态，不再同步打外网，
-    // 所以这次请求是快的，进页面立刻就能看到 frpc / cloudflared 两行。
+    // ── lifecycle 门控（2026-09-21）──
+    var lifecycleResumed by remember { mutableStateOf(true) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            lifecycleResumed = event == Lifecycle.Event.ON_RESUME
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            lifecycleResumed = false
+        }
+    }
+
     LaunchedEffect(Unit) {
         viewModel.tunnel.clearError()
         viewModel.tunnel.loadTunnelSettings()
@@ -60,15 +74,15 @@ fun TunnelSettingsScreen(viewModel: MainViewModel, navController: NavHostControl
     }
     // 懒加载：远端清单（最新版本 / 下载体积 / 是否有新版）由 core 在后台拉，
     // 这里每 1.5s 回读一次直到拿到 —— 用户不需要手动点「检查更新」才看到内容。
-    LaunchedEffect(state.componentManifestLoading) {
-        while (state.componentManifestLoading) {
+    LaunchedEffect(state.componentManifestLoading, lifecycleResumed) {
+        while (state.componentManifestLoading && lifecycleResumed) {
             delay(1500)
             viewModel.tunnel.loadComponents()
         }
     }
     // 安装进度：只在有任务时 1s 轮询，任务落终态后 refreshComponentTask 会自己补拉列表
-    LaunchedEffect(state.componentTask.active) {
-        while (state.componentTask.active) {
+    LaunchedEffect(state.componentTask.active, lifecycleResumed) {
+        while (state.componentTask.active && lifecycleResumed) {
             delay(1000)
             viewModel.tunnel.refreshComponentTask()
         }

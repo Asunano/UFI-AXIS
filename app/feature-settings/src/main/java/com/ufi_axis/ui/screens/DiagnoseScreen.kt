@@ -1,5 +1,8 @@
 package com.ufi_axis.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -11,18 +14,40 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
+import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.ufiStandardCard
 import com.ufi_axis.util.FormatUtils
 import com.ufi_axis.viewmodel.MainViewModel
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+
+
+
+/**
+ * 复制用的 JSON 缩进器。
+ *
+ * 只服务「复制原始 JSON」那个按钮：`field_coverage` 是十个分组的嵌套对象，
+ * `JsonElement.toString()` 会挤成一行，贴进文档做逐字比对时根本看不出差在哪一组。
+ * 放文件级而不是 remember：它无状态，每次重组新建一个 Json 实例纯属浪费。
+ */
+private val prettyJson = Json { prettyPrint = true }
 
 /**
  * 运行诊断页（2026-08-30）。
+
  *
  * 把 core 侧五个只读排障端点聚到一处：`/api/diagnose`、`/api/qos/status`、`/api/cache/stats`、
  * `/api/system/root-check`、`/api/shell/root`，另外挂上缓存的两个动作（清空 / 按规则失效）。
@@ -36,6 +61,10 @@ import kotlinx.coroutines.launch
  *   「检测字段覆盖率」时才开，并由 ViewModel 记住该选择。
  * - 读取失败不在页面顶部挂常驻错误条，只有动作（清缓存/失效）失败才弹 Toast ——
  *   排障页的价值在于「把还能读到的都显示出来」。
+ *
+ * 2026-09-22：字段覆盖率那张卡从「一行 `toString()`」改成「分组摘要 + 复制原始 JSON」。
+ * 动机是它现在是设备适配改造的验收工具（计划书 §14.3 要求改造前后各抓一份逐字比对），
+ * 而一行挤在一起的 JSON 既读不出「哪组没命中」，也没法可靠地贴进文档对账。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -43,6 +72,8 @@ fun DiagnoseScreen(viewModel: MainViewModel, navController: NavHostController) {
     val state by viewModel.diagnoseState.collectAsState()
     val palette = LocalResolvedPalette.current
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+
     var toastMessage by remember { mutableStateOf<ToastMessage?>(null) }
     var showClearCacheConfirm by remember { mutableStateOf(false) }
     var showInvalidateDialog by remember { mutableStateOf(false) }
@@ -50,13 +81,31 @@ fun DiagnoseScreen(viewModel: MainViewModel, navController: NavHostController) {
 
     LaunchedEffect(Unit) { viewModel.tools.loadDiagnostics() }
 
+    // 归一化开关的真值走 GET /api/config（不在上面五个诊断端点里），所以单独回读一次。
+    // 必须每次进页面都读：别端（web / 另一台手机）可能刚改过，本机镜像会是旧的。
+    LaunchedEffect(Unit) { viewModel.tools.loadFieldNormalizationSwitch() }
+
+    // 开关回读 / 下发失败统一走 toast，并立刻清掉 state 里的错误，否则每次重组都会再弹一次
+    // （与 DebugLogScreen 对日志开关的处理同一写法）。
+    LaunchedEffect(state.fieldNormalizationError) {
+        state.fieldNormalizationError?.let {
+            toastMessage = ToastMessage(it, ToastType.ERROR)
+            viewModel.tools.clearFieldNormalizationError()
+        }
+    }
+
     UfiScreenScaffold(
         title = "运行诊断",
         navController = navController,
         showBack = true,
         actions = {
             IconButton(
-                onClick = { viewModel.tools.loadDiagnostics() },
+                onClick = {
+                    viewModel.tools.loadDiagnostics()
+                    // 刷新按钮也带上这一项：否则页面上「配置值」永远停在进页面那一刻的快照，
+                    // 用户在 web 端改完回来点刷新会以为没生效。
+                    viewModel.tools.loadFieldNormalizationSwitch()
+                },
                 enabled = !state.isLoading
             ) { Icon(Icons.Default.Refresh, contentDescription = "刷新") }
         }
@@ -120,30 +169,161 @@ fun DiagnoseScreen(viewModel: MainViewModel, navController: NavHostController) {
                         }
                     }
 
+                    // ═════ 字段归一化开关（2026-09-22）═════
+                    // 刻意紧贴在「字段覆盖率」**上方**：两张卡是同一个排障动作的两半 ——
+                    // 覆盖率看「归一化后命中了什么」，这个开关用来关掉归一化、回到设备原始字段名做对照。
+                    //
+                    // 三件事必须同时说清，否则它就是个误导用户的开关：
+                    // 1. 配置值（GET /api/config）与**运行时实际值**（/api/diagnose 的 device_profile）
+                    //    是两回事 —— core 只在构造组件图时读一次，改完到重启之间两者不同；
+                    // 2. 生效条件（重启后台服务）必须写在界面上。PUT 响应的 needs_restart
+                    //    **不含**这个键（那份清单只覆盖认证/端口），靠它提示等于不提示；
+                    // 3. 老 core 的 GET 里没有这个键 → 开关禁用并说明原因，不给一个拖了没用的假开关。
+                    DiagnoseCard(title = "字段归一化") {
+                        val normConfig = state.fieldNormalizationEnabled
+                        val normRuntime = state.diagnose?.device_profile?.normalization_enabled
+                        // 可写 = 读到过真值 且 没有 PUT 在飞。两个条件缺一个都会产生假开关：
+                        // 前者是"拖了 core 收不到"，后者是"连点产生互相覆盖的并发 PUT"。
+                        val normWritable = normConfig != null && !state.fieldNormalizationSaving
+                        UfiSettingsItem(
+                            title = "启用字段归一化",
+                            description = when {
+                                normConfig == null && !state.fieldNormalizationRead ->
+                                    "还没从设备读到这一项（正在读，或连不上 core）。" +
+                                        "开关位置不代表设备状态，此时不可修改。"
+                                normConfig == null ->
+                                    "当前 core 不在 GET /api/config 里返回 field_normalization_enabled，" +
+                                        "因此读不到也改不动（需要升级 core）。" +
+                                        "下面一行是 /api/diagnose 报的运行时实际状态。"
+                                else ->
+                                    // 下发中只**追加**一句，不替换整段：把说明换成「正在下发…」会让
+                                    // 那条重启提示在用户刚点完开关、最需要看到它的那一刻消失。
+                                    "关掉后 core 读侧不再按 profile 归一化，原样透出设备原始字段名，" +
+                                        "用来与下面的覆盖率结果做对照排障。" +
+                                        "需重启后台服务生效 —— core 只在启动时读一次这一项。" +
+                                        if (state.fieldNormalizationSaving) "（正在下发…）" else ""
+                            },
+                            enabled = normWritable,
+                            trailing = {
+                                UfiSwitch(
+                                    // 读不到配置值时退一步显示**运行时实际值**（两者都没有才是 false，
+                                    // 那一支的说明文案已明说"位置不代表设备状态"）。
+                                    // 绝不写 `?: true` 拿 core 的默认值冒充：开关可拖但改不动 = 假开关。
+                                    checked = normConfig ?: normRuntime ?: false,
+                                    enabled = normWritable,
+                                    onCheckedChange = { viewModel.tools.setFieldNormalizationEnabled(it) }
+                                )
+                            }
+                        )
+                        if (normRuntime != null) {
+                            UfiInfoRow(
+                                "运行时实际状态",
+                                if (normRuntime) "归一化生效中" else "已关闭 · 原样透传设备字段"
+                            )
+                        }
+                        // 配置值与运行时不一致 = 用户已经改过、但还没重启。这一条是"改了为什么没反应"
+                        // 的唯一答案，比上面那句通用提示更要紧，所以用 warning 色单独一行。
+                        if (normConfig != null && normRuntime != null && normConfig != normRuntime) {
+                            Text(
+                                "配置已是「${normSwitchLabel(normConfig)}」，当前运行的组件图仍是" +
+                                    "「${normSwitchLabel(normRuntime)}」—— 重启后台服务后才会生效。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = palette.warning
+                            )
+                        }
+                    }
+
                     // ═════ 字段覆盖率（按需，会打设备） ═════
+                    // 这一块是「设备适配改造」的验收工具（计划书 §14.3）：改造前后各抓一份逐字比对，
+                    // 就能证明读侧行为没变。所以摘要（给眼睛看）与**原始 JSON**（给比对用）两者都要有 ——
+                    // 只有摘要的话，贴进文档对账时会因为排版差异误判成「行为变了」。
                     DiagnoseCard(title = "字段覆盖率") {
                         val coverage = state.diagnose?.field_coverage
-                        if (coverage == null) {
-                            Text(
-                                "检测会逐分组向设备发查询（最多 10 组），比较慢，所以默认不做。",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = palette.textSecondary
-                            )
+                        Text(
+                            "检测会逐分组向设备发查询（最多 10 组），比较慢，所以默认不做；" +
+                                "只在做设备适配、需要前后对账时点一次。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.textSecondary
+                        )
+                        if (coverage != null) FieldCoverageDetail(coverage)
+                        UfiButton(
+                            variant = UfiButtonVariant.Secondary,
+                            text = if (coverage == null) "检测字段覆盖率" else "重新检测（再打一次设备）",
+                            onClick = { viewModel.tools.loadDiagnostics(withFieldCoverage = true) },
+                            enabled = !state.isLoading,
+                            loading = state.isLoading,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        if (coverage != null) {
                             UfiButton(
-                                variant = UfiButtonVariant.Secondary,
-                                text = "检测字段覆盖率",
-                                onClick = { viewModel.tools.loadDiagnostics(withFieldCoverage = true) },
-                                enabled = !state.isLoading,
-                                loading = state.isLoading,
+                                variant = UfiButtonVariant.Subtle,
+                                text = "复制原始 JSON",
+                                onClick = {
+                                    // 复用 app 里既有的剪贴板写法（ClipboardManager + ClipData，同
+                                    // DeliveryHistoryScreen / DebugLogScreen），不引第二套；
+                                    // 复制的是**缩进后的 field_coverage 原文**而不是屏幕上的摘要，
+                                    // 摘要漏掉了 queried 等字段，逐字比对会对不上。
+                                    runCatching {
+                                        val cm = context
+                                            .getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                        cm.setPrimaryClip(
+                                            ClipData.newPlainText(
+                                                "field_coverage",
+                                                prettyJson.encodeToString(JsonElement.serializer(), coverage)
+                                            )
+                                        )
+                                        toastMessage = ToastMessage("已复制 field_coverage", ToastType.SUCCESS)
+                                    }.onFailure {
+                                        toastMessage = ToastMessage("复制失败", ToastType.ERROR)
+                                    }
+                                },
                                 modifier = Modifier.fillMaxWidth()
                             )
-                        } else {
-                            // 形状随 core 演进（失败时会退化成 {"error": "..."} 但仍 200），
-                            // 所以原样展示而不是按固定字段解 —— 排障页要的是原文。
-                            Text(
-                                coverage.toString(),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = palette.textSecondary
+                        }
+                    }
+
+                    // ═════ CPU 控制能力探测（2026-10-08）═════
+                    // 为「处理器管理 / 智能调度」做的真机前置勘察：一次探测回报
+                    // cpufreq policy 矩阵（每组核的当前/最小/最大频率、governor 及其可选值、
+                    // 频率表）、per-cpu online 节点的存在性与可写性、thermal zone 快照。
+                    // 探测会发 20+ 条 shell（5~15s），所以独立按钮独立 loading，不跟页面刷新走。
+                    DiagnoseCard(title = "CPU 控制能力") {
+                        val probe = state.cpuProbe
+                        Text(
+                            "探测会检查每核 cpufreq 节点的读写权限与 online 开关（全部只读或写回原值，" +
+                                "不会改动设备状态），约 5~15 秒。用于确认处理器管理功能在这台设备上能开放到什么程度。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.textSecondary
+                        )
+                        if (probe != null) CpuProbeDetail(probe)
+                        UfiButton(
+                            variant = UfiButtonVariant.Secondary,
+                            text = if (probe == null) "开始探测" else "重新探测",
+                            onClick = { viewModel.tools.runCpuProbe() },
+                            enabled = !state.cpuProbing,
+                            loading = state.cpuProbing,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        if (probe != null) {
+                            UfiButton(
+                                variant = UfiButtonVariant.Subtle,
+                                text = "复制原始 JSON",
+                                onClick = {
+                                    runCatching {
+                                        val cm = context
+                                            .getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                        cm.setPrimaryClip(
+                                            ClipData.newPlainText(
+                                                "cpu_probe",
+                                                prettyJson.encodeToString(JsonElement.serializer(), probe)
+                                            )
+                                        )
+                                        toastMessage = ToastMessage("已复制 cpu_probe", ToastType.SUCCESS)
+                                    }.onFailure {
+                                        toastMessage = ToastMessage("复制失败", ToastType.ERROR)
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth()
                             )
                         }
                     }
@@ -185,6 +365,8 @@ fun DiagnoseScreen(viewModel: MainViewModel, navController: NavHostController) {
                             // any_cache 是另一张表，不计入 count，也不含在体积估算里
                             UfiInfoRow("any 缓存", "${c.any_cache_count} 条（不计入上面）")
                             UfiInfoRow("体积估算", FormatUtils.formatBytes(c.total_bytes_estimate))
+                            // 2026-10-05 P1 收尾：过期滞留观测（expired_count），健康态应远小于 count
+                            UfiInfoRow("过期滞留", "${c.expired_count} / ${c.count}")
                             UfiInfoRow("是否可能过期", if (c.stale) "是 · WS 曾断开" else "否")
                             c.entries.firstOrNull()?.let {
                                 UfiInfoRow("最旧条目", "${it.key} · ${it.age_ms / 1000}s")
@@ -265,7 +447,8 @@ fun DiagnoseScreen(viewModel: MainViewModel, navController: NavHostController) {
                 }
             },
             confirmText = "失效",
-            dismissText = "取消"
+            dismissText = "取消",
+            topSpacing = Spacing.Large
         )
     }
 }
@@ -289,6 +472,14 @@ private fun boolLabel(v: Boolean?): String = when (v) {
 }
 
 /**
+ * 归一化开关的「开启 / 关闭」措辞。
+ *
+ * 不复用 [boolLabel]（是/否）：那条文案对比的是**两个开关位置**（配置值 vs 运行时实际值），
+ * 写成「配置已是『是』」根本读不出说的是开还是关。
+ */
+private fun normSwitchLabel(enabled: Boolean): String = if (enabled) "开启" else "关闭"
+
+/**
  * `device_profile.status` 四态中文化。
  * `fallback` 是「型号填错」的唯一线索 —— core 只在启动日志里打 WARN，不看这里就得翻日志。
  */
@@ -298,4 +489,229 @@ private fun profileStatusLabel(status: String): String = when (status) {
     "fallback" -> "已回落（配置的 profile 不存在）"
     "disabled" -> "归一化已关闭"
     else -> status.ifBlank { "未知" }
+}
+
+/**
+ * `field_coverage` 的逐分组摘要（2026-09-22）。
+ *
+ * 为什么手写 JSON 遍历而不给它建 data class：这一块的形状**按 core 版本漂移**，而且有三种
+ * 退化形态（见下），强类型解析一旦遇到新键就整块空白，正好在排障时最不该空白。这里只认
+ * 「能认出来的键」，认不出的原样保留在「复制原始 JSON」里 —— 摘要给眼睛，原文给对账。
+ *
+ * 三种形态都必须如实显示，不能统一渲染成「没有数据」：
+ * - `{"error": "..."}` —— 统计自身失败，HTTP 仍是 200；
+ * - `{"normalization_enabled": false, "hint": "..."}` —— 归一化总开关关了，core 压根没查设备；
+ * - 正常形态 `{normalization_enabled, profile_id, profile_name, groups{...}}`。
+ */
+@Composable
+private fun FieldCoverageDetail(coverage: JsonElement) {
+    val palette = LocalResolvedPalette.current
+    val obj = coverage as? JsonObject
+    if (obj == null) {
+        // core 只会回对象；真回了别的（数组 / 裸串）也照原文贴出来，不吞掉。
+        Text(coverage.toString(), style = UfiTextStyles.monoNote, color = palette.textSecondary)
+        return
+    }
+
+    obj.coverageString("error")?.let {
+        Text("统计失败：$it", style = UfiTextStyles.note, color = palette.error)
+        return
+    }
+
+    // 关掉归一化时 core 只回一句 hint。那不是「检测失败」也不是「没有数据」，
+    // 而是「没有登记表可比对」—— 原文显示出来，用户才知道要去打开 field_normalization_enabled。
+    val enabled = (obj["normalization_enabled"] as? JsonPrimitive)?.booleanOrNull ?: false
+    if (!enabled) {
+        Text(
+            obj.coverageString("hint") ?: "core 回了 normalization_enabled=false，但没带 hint。",
+            style = UfiTextStyles.note,
+            color = palette.warning
+        )
+        return
+    }
+
+    UfiInfoRow("生效 profile", obj.coverageString("profile_id") ?: "未知")
+    obj.coverageString("profile_name")?.let { UfiInfoRow("profile 名称", it) }
+
+    val groups = obj["groups"] as? JsonObject
+    if (groups.isNullOrEmpty()) {
+        Text(
+            "core 回了 normalization_enabled=true 但没有 groups —— core 版本可能比 app 旧。",
+            style = UfiTextStyles.note,
+            color = palette.warning
+        )
+        return
+    }
+
+    for ((name, raw) in groups) {
+        val group = raw as? JsonObject ?: continue
+        val registered = group.coverageInt("registered") ?: 0
+        val hit = group.coverageInt("hit") ?: 0
+        // queried=false = 这个 profile 没给该分组登记命令表，core 一次设备查询都没发；
+        // 它与「查了但 0 命中」是两件事，混成同一句会把「表没写」误判成「设备不支持」。
+        val queried = (group["queried"] as? JsonPrimitive)?.booleanOrNull ?: false
+        val missing = (group["missing"] as? JsonArray)
+            ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+            .orEmpty()
+        val hitSource = (group["hit_source"] as? JsonObject)
+            ?.mapNotNull { (canonical, source) ->
+                (source as? JsonPrimitive)?.contentOrNull?.let { "$canonical ← $it" }
+            }
+            .orEmpty()
+
+        Column(verticalArrangement = Arrangement.spacedBy(Spacing.Small)) {
+            UfiInfoRow(name, if (queried) "命中 $hit / 登记 $registered" else "未登记命令")
+            if (missing.isNotEmpty()) {
+                // missing 就是适配新设备时的 TODO 清单，所以用 warning 色单独一行列出来。
+                Text(
+                    "未命中：${missing.joinToString("、")}",
+                    style = UfiTextStyles.monoNote,
+                    color = palette.warning
+                )
+            }
+            if (hitSource.isNotEmpty()) {
+                Text(
+                    "命中来源：${hitSource.joinToString("、")}",
+                    style = UfiTextStyles.monoNote,
+                    color = palette.textSecondary
+                )
+            }
+        }
+    }
+}
+
+/** 只认字符串型的键：core 把数字/布尔放进来时不要拿它的字面量当文案显示。 */
+private fun JsonObject.coverageString(key: String): String? =
+    (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull?.takeIf { it.isNotBlank() }
+
+/** 只认数字型的键：缺键 / 类型不对时回 null，由调用点决定显示成什么，不静默当 0。 */
+private fun JsonObject.coverageInt(key: String): Int? = (this[key] as? JsonPrimitive)?.intOrNull
+
+
+
+/**
+ * CPU 探测结果卡的内容（2026-10-08）。
+ *
+ * 与 [FieldCoverageDetail] 同一设计取向：结果形状随内核/机型漂移，只认认得出的键，
+ * 认不出的（或退化形态）走「复制原始 JSON」对账，不在这里吞掉。
+ *
+ * 渲染重点按后续「处理器管理」功能的需求排序：
+ * 1. 每个 policy 一块：核组、当前/最小/最大频率（kHz→MHz）、governor 及可选值、可写性；
+ * 2. per-cpu online：节点存在 + 可写 = 「开关核心」功能可行；
+ * 3. 结论行：freq_writable / gov_writable / online_writable 三项汇总——三项全绿
+ *    代表频率限制、governor 切换、核开关全部可编程；全红则只能靠现有只读监控。
+ */
+@Composable
+private fun CpuProbeDetail(probe: JsonElement) {
+    val palette = LocalResolvedPalette.current
+    val obj = probe as? JsonObject
+    if (obj == null) {
+        Text(probe.toString(), style = UfiTextStyles.monoNote, color = palette.textSecondary)
+        return
+    }
+    if ((obj["ok"] as? JsonPrimitive)?.booleanOrNull == false) {
+        Text(
+            "探测失败：" + ((obj["error"] as? JsonPrimitive)?.contentOrNull ?: "未知原因"),
+            style = UfiTextStyles.note,
+            color = palette.error
+        )
+        return
+    }
+
+    UfiInfoRow("内核", obj.str("kernel").ifBlank { "未知" })
+    obj.str("board").takeIf { it.isNotBlank() }?.let { UfiInfoRow("平台", it) }
+    UfiInfoRow("核心数", obj.str("cores_declared").ifBlank { "未知" })
+
+    val policies = obj["policies"] as? JsonArray
+    if (!policies.isNullOrEmpty()) {
+        Spacer(Modifier.height(Spacing.Small))
+        Text("调频域（policy）", style = MaterialTheme.typography.titleSmall, color = palette.textPrimary)
+        for ((i, raw) in policies.withIndex()) {
+            val p = raw as? JsonObject ?: continue
+            val cpus = (p["cpus"] as? JsonArray)
+                ?.mapNotNull { (it as? JsonPrimitive)?.intOrNull }?.joinToString(",")
+            Column(verticalArrangement = Arrangement.spacedBy(Spacing.Small)) {
+                UfiInfoRow("CPU 组 ${i + 1}", "cpu$cpus")
+                UfiInfoRow("当前频率", p.freqMHz("cur_freq"))
+                UfiInfoRow("范围", "${p.freqMHz("min_freq")} ~ ${p.freqMHz("max_freq")}")
+                UfiInfoRow("调频策略", p.str("governor").ifBlank { "未知" })
+                val govs = p.strList("available_governors")
+                if (govs.isNotEmpty()) UfiInfoRow("可选策略", govs.joinToString("、"))
+                UfiInfoRow(
+                    "频率上限可写",
+                    if ((p["freq_writable"] as? JsonPrimitive)?.booleanOrNull == true) "✓ 可写" else "✗ 不可写",
+                )
+                UfiInfoRow(
+                    "策略可切换",
+                    if ((p["gov_writable"] as? JsonPrimitive)?.booleanOrNull == true) "✓ 可写" else "✗ 不可写",
+                )
+            }
+        }
+    }
+
+    val online = obj["online_nodes"] as? JsonArray
+    if (!online.isNullOrEmpty()) {
+        Spacer(Modifier.height(Spacing.Small))
+        Text("核心开关（online 节点）", style = MaterialTheme.typography.titleSmall, color = palette.textPrimary)
+        val writable = online.mapNotNull { it as? JsonObject }
+            .count { (it["writable"] as? JsonPrimitive)?.booleanOrNull == true }
+        val withNode = online.mapNotNull { it as? JsonObject }
+            .count { (it["node_exists"] as? JsonPrimitive)?.booleanOrNull == true }
+        UfiInfoRow("节点存在", "$withNode / ${online.size}")
+        UfiInfoRow("可写（可开/关核）", "$writable / ${online.size}")
+        if (writable > 0) {
+            val list = online.mapNotNull { it as? JsonObject }
+                .filter { (it["writable"] as? JsonPrimitive)?.booleanOrNull == true }
+                .mapNotNull { (it["cpu"] as? JsonPrimitive)?.intOrNull }
+                .joinToString(",")
+            Text(
+                "可编程核心：cpu$list",
+                style = UfiTextStyles.monoNote,
+                color = palette.textSecondary
+            )
+        }
+    }
+
+    val zones = obj["thermal_zones"] as? JsonArray
+    if (!zones.isNullOrEmpty()) {
+        Spacer(Modifier.height(Spacing.Small))
+        Text(
+            "温度区：${zones.size} 个（原始 JSON 含当前温度）",
+            style = MaterialTheme.typography.bodySmall,
+            color = palette.textSecondary
+        )
+    }
+
+    // 结论行：三项能力汇总，一眼看出这台设备能开放到哪一档
+    Spacer(Modifier.height(Spacing.Small))
+    val anyFreq = (policies ?: JsonArray(emptyList())).any { (it as? JsonObject)?.get("freq_writable")?.let { e -> (e as? JsonPrimitive)?.booleanOrNull } == true }
+    val anyGov = (policies ?: JsonArray(emptyList())).any { (it as? JsonObject)?.get("gov_writable")?.let { e -> (e as? JsonPrimitive)?.booleanOrNull } == true }
+    val anyOnline = (online ?: JsonArray(emptyList())).any { (it as? JsonObject)?.get("writable")?.let { e -> (e as? JsonPrimitive)?.booleanOrNull } == true }
+    val conclusion = when {
+        anyOnline -> "✓ 全能档：频率限制 + 策略切换 + 核心开关均可编程，智能调度可完整实现"
+        anyFreq && anyGov -> "△ 频率档：可限频/切策略，但核心开关不可编程（用最低频率替代关核）"
+        anyFreq -> "△ 仅限频：governor 与核心开关不可编程"
+        else -> "✗ 只读：cpufreq 不可写，处理器管理只能做监控展示"
+    }
+    Text(
+        conclusion,
+        style = MaterialTheme.typography.bodySmall,
+        color = when {
+            anyOnline -> palette.success
+            anyFreq -> palette.warning
+            else -> palette.error
+        }
+    )
+}
+
+private fun JsonObject.str(key: String): String = (this[key] as? JsonPrimitive)?.contentOrNull.orEmpty()
+
+private fun JsonObject.strList(key: String): List<String> =
+    (this[key] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.orEmpty()
+
+/** kHz 原始值转 MHz 展示；空值/非数字原样回 "?"。 */
+private fun JsonObject.freqMHz(key: String): String {
+    val raw = str(key)
+    val khz = raw.toLongOrNull() ?: return if (raw.isBlank()) "?" else raw
+    return if (khz >= 1_000_000) "%.2f GHz".format(khz / 1_000_000.0) else "${khz / 1000} MHz"
 }

@@ -130,6 +130,10 @@ fun WebhookNotifyScreen(viewModel: MainViewModel, navController: NavHostControll
     LaunchedEffect(Unit) {
         viewModel.tools.loadWebhookConfig()
         viewModel.tools.loadDeliveryHistory(DELIVERY_CHANNEL_WEBHOOK)
+        viewModel.tools.loadDeliveryStats(DELIVERY_CHANNEL_WEBHOOK)
+    }
+    rememberResumeRefresh {
+        viewModel.tools.loadDeliveryStats(DELIVERY_CHANNEL_WEBHOOK)
     }
 
     var toastMessage by remember { mutableStateOf<ToastMessage?>(null) }
@@ -187,6 +191,58 @@ fun WebhookNotifyScreen(viewModel: MainViewModel, navController: NavHostControll
         UfiPageBackground(modifier = Modifier.padding(padding)) {
             state.errorMessage?.let { err -> UfiErrorBanner(message = err) }
 
+            // 投递统计（三渠道共用卡；数据源 history/stats，不依赖配置是否读得到）
+            run {
+                val st = toolsState.deliveryStats
+                val ready = toolsState.deliveryStatsLoaded &&
+                    toolsState.deliveryStatsChannel == DELIVERY_CHANNEL_WEBHOOK
+                val canTest = state.config?.enabled == true && !state.testing
+                ChannelDeliveryStatsCard(
+                    total = st?.total,
+                    mid = st?.failed,
+                    failed = st?.skipped,
+                    lastSuccessTs = st?.lastSentAt,
+                    totalLabel = "总投递",
+                    midLabel = "投递失败",
+                    failedLabel = "已拦截",
+                    loaded = ready,
+                    testRow = {
+                        // 与邮件页同构：测试行挂在统计卡内。未启用时不给点 ——
+                        // core 的 /test 在 !enabled 时直接回错，可点等于请用户撞必然失败的接口。
+                        UfiSettingsItem(
+                            title = "发送测试通知",
+                            description = if (state.config?.enabled == true) {
+                                "不受总开关、免打扰与场景勾选约束，仅验证这条 HTTP 链路是否可用"
+                            } else {
+                                "需先启用 Webhook 通知"
+                            },
+                            enabled = canTest,
+                            onClick = { viewModel.tools.testWebhook() },
+                            trailing = {
+                                UfiButton(
+                                    text = "试发",
+                                    variant = UfiButtonVariant.Subtle,
+                                    size = UfiButtonSize.Small,
+                                    enabled = canTest,
+                                    loading = state.testing,
+                                    onClick = { viewModel.tools.testWebhook() }
+                                )
+                            }
+                        )
+                    }
+                )
+                state.lastTest?.let { result ->
+                    UfiSettingsRowCard {
+                        UfiSettingsValue(
+                            title = "最近测试结果",
+                            description = summarizeTestOutcome(result),
+                            value = webhookStatusValue(result),
+                            onClick = { dialog = WebhookDialog.TestResult }
+                        )
+                    }
+                }
+            }
+
             val cfg = state.config
             if (cfg == null) {
                 // 还没读完 → 骨架；读完了还是 null → 真读失败，给重试。
@@ -231,6 +287,21 @@ fun WebhookNotifyScreen(viewModel: MainViewModel, navController: NavHostControll
                     checked = cfg.enabled,
                     onCheckedChange = { persist(WebhookConfigPatch(enabled = it)) }
                 )
+            }
+
+            // ── ①.5 还没配好时给一条引导路（2026-09-21）──
+            // 本页是日常微调面板：十张卡各自独立、改完立即下发，从 0 配起时"先干哪一步"没人告诉你。
+            // 所以在 configured=false 时加一个入口，指向分步向导（选预设 → 密钥 → 规则 → 保存并启用）。
+            // 配好之后这张卡自动消失，日常调整仍在本页 —— 不是把本页替换掉。
+            if (!cfg.configured) {
+                UfiSettingsRowCard {
+                    UfiSettingsItem(
+                        icon = Icons.Default.VpnKey,
+                        title = "用引导配置",
+                        description = "分 4 步问清：推到哪个服务、那串密钥、推什么级别与场景，填完直接启用",
+                        onClick = { navController.navigate(Routes.DETAIL_WEBHOOK_SETUP) }
+                    )
+                }
             }
 
             // ── ② 预设。选中态走 UfiPopupOption.isSelected（组件自带 ✓ + accent），
@@ -450,47 +521,7 @@ fun WebhookNotifyScreen(viewModel: MainViewModel, navController: NavHostControll
                 )
             }
 
-            // ── ⑨ 发送测试 + 最近结果 ──
-            UfiSettingsGroup {
-                UfiSectionHeader(title = "测试")
-                // 只看本行自己的请求在飞，不看别人的 loading（那是邮件页踩过的坑①）。
-                // 未启用时不给点：core 的 /test 在 `!cfg.enabled` 时直接回错，
-                // 让按钮可点等于请用户去撞一个必然失败的接口。
-                val canTest = cfg.enabled && !state.testing
-                UfiSettingsItem(
-                    title = "发送测试通知",
-                    description = if (cfg.enabled) {
-                        "不受总开关、免打扰与场景勾选约束，仅验证这条 HTTP 链路是否可用"
-                    } else {
-                        "需先启用 Webhook 通知"
-                    },
-                    enabled = canTest,
-                    // enabled = false 时 UfiSettingsItem 自己吞掉点击，不必再叠一层 clickable。
-                    onClick = { viewModel.tools.testWebhook() },
-                    trailing = {
-                        // 请求在飞时由按钮自己转圈（loading 会顺带禁用点击），
-                        // 不再手写一段"发送中…"的 accent 小字。
-                        UfiButton(
-                            text = "试发",
-                            variant = UfiButtonVariant.Subtle,
-                            size = UfiButtonSize.Small,
-                            enabled = canTest,
-                            loading = state.testing,
-                            onClick = { viewModel.tools.testWebhook() }
-                        )
-                    }
-                )
-
-                state.lastTest?.let { result ->
-                    UfiDivider()
-                    UfiSettingsValue(
-                        title = "最近测试结果",
-                        description = summarizeTestOutcome(result),
-                        value = webhookStatusValue(result),
-                        onClick = { dialog = WebhookDialog.TestResult }
-                    )
-                }
-            }
+            // 测试入口已并入顶部「发送统计」卡（与邮件页同构）；最近结果仍在统计卡下方单独一行。
 
             // ── ⑩ 最近投递。位置与另两条渠道页一致（测试之后、页尾之前）：
             //    先给"能不能通"，再给"实际通了几次" ──
@@ -760,17 +791,21 @@ private fun SecretEditDialog(
         onDismiss = onDismiss,
         title = field.label,
         confirmButton = {
+            // 关闭动作交给 shell 排时序：离场 backdrop（逐渐清晰）要播完才卸载窗口，
+            // 见 LocalUfiDialogClose；必须在 slot 内部读才能拿到 shell 注入的实现。
+            val close = LocalUfiDialogClose.current
             UfiButton(
                 // 空输入时按钮改说「清空」：点下去的后果与"保存一个值"不是一回事
                 // （渠道会退回未配置并停止发送），措辞必须先说清楚。
                 text = if (trimmed.isEmpty()) "清空" else "保存",
                 enabled = error == null && !saving,
                 loading = saving,
-                onClick = { onSave(field.merged(draft)) }
+                onClick = { close { onSave(field.merged(draft)) } }
             )
         },
         dismissButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = onDismiss)
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close(onDismiss) })
         }
     ) {
         UfiDialogBody {
@@ -827,14 +862,16 @@ private fun HeaderEditDialog(
         onDismiss = onDismiss,
         title = if (originalName == null) "添加请求头" else "编辑请求头",
         confirmButton = {
+            val close = LocalUfiDialogClose.current
             UfiButton(
                 text = "保存",
                 enabled = trimmedName.isNotEmpty() && nameError == null && valueError == null,
-                onClick = { onSave(trimmedName, value) }
+                onClick = { close { onSave(trimmedName, value) } }
             )
         },
         dismissButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = onDismiss)
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close(onDismiss) })
         }
     ) {
         UfiDialogBody {
@@ -1309,8 +1346,13 @@ private const val HIGHLIGHT_RISK_NOTE =
 private const val PRESET_ISOLATION_NOTE =
     "每个预设的请求地址与请求体模板各自保存，切换不会丢"
 
-/** 当前 url / 模板与预设默认结构不同时的说明（此时不给简易输入框，见 [resolveSecretField]）。 */
-private const val SECRET_DETACHED_NOTE =
+/**
+ * 当前 url / 模板与预设默认结构不同时的说明（此时不给简易输入框，见 [resolveSecretField]）。
+ *
+ * `internal` 而不是 `private`：首次配置向导（`WebhookSetupWizardScreen`）会走到同一个分支，
+ * 同一件事在两条路径上必须是同一句话 —— 各写一份就会漂。
+ */
+internal const val SECRET_DETACHED_NOTE =
     "当前配置与预设默认结构不同（请求地址或请求体模板被改过），无法只改这一段。" +
         "请在「请求体模板」或「高级设置 → 请求配置」中直接编辑。"
 

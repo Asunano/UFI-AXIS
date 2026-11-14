@@ -40,6 +40,7 @@ import com.ufi_axis.data.model.ExecutionLog
 import com.ufi_axis.data.model.ScheduledTask
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.LocalResolvedPalette
+import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.ufiCardShadow
@@ -62,16 +63,35 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
     // 条件规则 / 定时任务编辑均走全屏路由（弹窗字段多易被裁切，2026-08-18 改为全屏）。
     var viewingRuleLogs by remember { mutableStateOf<AutomationRule?>(null) }
 
+    // ── 二次确认状态（2026-09-21：审计补全） ──
+    var showClearAllConfirm by remember { mutableStateOf(false) }
+    var pendingDeleteTask by remember { mutableStateOf<ScheduledTask?>(null) }
+    var pendingDeleteRule by remember { mutableStateOf<AutomationRule?>(null) }
+
+
+    /*
+     * 进页面拉一次，**回前台再拉一次**（2026-09-20 补）。
+     *
+     * 这一页的数据在 Web 面板那边也能改，而 `/ws/realtime` 原来没有任务相关的推送 ——
+     * 于是"Web 新建任务 → 切回 App"永远看不到，除非退出页面重新进。
+     * 补 core 侧 WS 推送的同时，这里也加上 resume 刷新：其它十个数据页
+     * （短信 / 网络 / 投递历史 / 通知管理…）早就这么做了，本页是唯一漏的。
+     */
     LaunchedEffect(Unit) {
         viewModel.tools.loadTaskList()
         viewModel.tools.loadRuleList()
     }
+    rememberResumeRefresh {
+        viewModel.tools.loadTaskList()
+        viewModel.tools.loadRuleList()
+    }
+
 
     UfiScreenScaffold(title = "自动化", navController = navController, showBack = true,
         actions = {
             val hasItems = if (selectedTab == 0) state.tasks.isNotEmpty() else state.rules.isNotEmpty()
             if (hasItems) {
-                IconButton(onClick = { if (selectedTab == 0) viewModel.tools.clearTasks() else viewModel.tools.clearRules() }) {
+                IconButton(onClick = { showClearAllConfirm = true }) {
                     Icon(Icons.Default.DeleteSweep, "清除全部")
                 }
             }
@@ -107,7 +127,10 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
 
             if (selectedTab == 0) {
                 // ── 定时任务 ──
-                if (state.tasks.isEmpty() && !state.isLoading) {
+                // 空态门看 tasksLoaded（成功读到过）而不是 !isLoading：
+                // 后者在"请求还在飞"和"请求失败了"时都是 false，于是首次进页面
+                // 会抢在响应到达前宣布"暂无任务"——这正是 Web 端新建的任务看不到的原因。
+                if (state.tasks.isEmpty() && state.tasksLoaded) {
                     // 2026-09-08：这里原来是手搓的「圆底图标 + 两级文字 + 胶囊按钮」整块。
                     // 那套版式已经收进公共组件 [UfiEmptyState]（连尺寸档位一起提到 Spacing），
                     // 本页改为调用它 —— 观感不变，全站空态从此只有一份实现。
@@ -133,7 +156,7 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
                         items(state.tasks, key = { it.id }) { task ->
                             TaskCard(task = task,
                                 onEdit = { navController.navigate("detail/task-edit?id=${it.id}") },
-                                onDelete = { viewModel.tools.deleteTask(it.id) },
+                                onDelete = { pendingDeleteTask = it },
                                 onToggle = { viewModel.tools.updateTask(it.id, it.copy(enabled = !it.enabled)) },
                                 onShowLogs = { viewModel.tools.loadTaskLogs(it.id); viewingTaskLogs = it }
                             )
@@ -142,7 +165,10 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
                 }
             } else {
                 // ── 条件规则（当…就…）──
-                if (state.rules.isEmpty() && !state.isLoading) {
+                // 同上：看 rulesLoaded 而不是 !isLoading。
+                // 这一侧原来还有第二重伤害 —— loadTaskList 会把 rules 一起清空，
+                // 于是"动一下任务开关"就让规则 Tab 显示「暂无自动化规则」。
+                if (state.rules.isEmpty() && state.rulesLoaded) {
                     UfiEmptyState(
                         icon = Icons.Default.AutoAwesome,
                         message = "暂无自动化规则",
@@ -165,7 +191,7 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
                         items(state.rules, key = { it.id }) { rule ->
                             RuleCard(rule = rule,
                                 onEdit = { navController.navigate("detail/rule-edit?id=${it.id}") },
-                                onDelete = { viewModel.tools.deleteRule(it.id) },
+                                onDelete = { pendingDeleteRule = it },
                                 onToggle = { viewModel.tools.updateRule(it.id, it.copy(enabled = !it.enabled)) },
                                 onShowLogs = { viewModel.tools.loadRuleLogs(it.id); viewingRuleLogs = it }
                             )
@@ -174,6 +200,43 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
                 }
             }
         }
+    }
+
+    // ── 二次确认弹窗（2026-09-21 审计补全：清空全部 / 删除单个任务 / 删除单个规则） ──
+    if (showClearAllConfirm) {
+        val isTask = selectedTab == 0
+        val count = if (isTask) state.tasks.size else state.rules.size
+        UfiConfirmDialog(
+            title = if (isTask) "清空全部定时任务" else "清空全部条件规则",
+            text = "将删除当前全部 $count 条${if (isTask) "定时任务" else "条件规则"}，此操作不可恢复。",
+            confirmText = "全部删除",
+            destructive = true,
+            onDismiss = { showClearAllConfirm = false },
+            onConfirm = {
+                showClearAllConfirm = false
+                if (isTask) viewModel.tools.clearTasks() else viewModel.tools.clearRules()
+            }
+        )
+    }
+    pendingDeleteTask?.let { task ->
+        UfiConfirmDialog(
+            title = "删除任务",
+            text = "确定删除「${task.name.ifBlank { "未命名任务" }}」？删除后不可恢复。",
+            confirmText = "删除",
+            destructive = true,
+            onDismiss = { pendingDeleteTask = null },
+            onConfirm = { pendingDeleteTask = null; viewModel.tools.deleteTask(task.id) }
+        )
+    }
+    pendingDeleteRule?.let { rule ->
+        UfiConfirmDialog(
+            title = "删除规则",
+            text = "确定删除「${rule.name.ifBlank { "未命名规则" }}」？删除后不可恢复。",
+            confirmText = "删除",
+            destructive = true,
+            onDismiss = { pendingDeleteRule = null },
+            onConfirm = { pendingDeleteRule = null; viewModel.tools.deleteRule(rule.id) }
+        )
     }
 
     viewingTaskLogs?.let { task ->
@@ -282,17 +345,15 @@ private fun ScheduledTask.toScheduleValue(): ScheduleValue {
 }
 
 /** 列表副标题：每天 08:30 / 每周一三五 19:30 / 每月1,15日 08:30 等。 */
-private fun scheduleSummary(task: ScheduledTask): String {
-    val cron = task.cron
-    val scheduleType = task.scheduleType
-    val sv = if (cron != null && scheduleType != null)
-        CronParser.toScheduleValue(cron, scheduleType)
-    else
-        ScheduleValue(
-            scheduleType = if (task.repeatDaily) SchedulePreset.DAILY.type else "once",
-            hour = task.hour,
-            minute = task.minute
-        )
+private fun scheduleSummary(task: ScheduledTask): String = scheduleValueSummary(task.toScheduleValue())
+
+/**
+ * 把 [ScheduleValue] 渲染成一句中文周期描述。
+ *
+ * 2026-09-21 从 [scheduleSummary] 里提出来：向导的确认页要对**编辑中的** ScheduleValue
+ * 出同一句话，而那时还没有 ScheduledTask 对象。两处共用一个实现，措辞不会漂。
+ */
+private fun scheduleValueSummary(sv: ScheduleValue): String {
     val hm = "%02d:%02d".format(sv.hour, sv.minute)
     return when (sv.scheduleType) {
         "once" -> "仅一次 $hm"
@@ -349,7 +410,8 @@ private fun TaskLogDialog(task: ScheduledTask, logs: List<ExecutionLog>, onDismi
             onDismiss = onDismiss,
             onConfirm = onDismiss,
             confirmText = "关闭",
-            dismissText = null
+            dismissText = null,
+            topSpacing = Spacing.Large
         )
     }
 }
@@ -392,11 +454,18 @@ private fun LogEntryItem(log: ExecutionLog, timeFormat: SimpleDateFormat) {
     }
 }
 
-// ============ 定时任务编辑器（全屏 Route 页面） ============
+// ============ 定时任务编辑器（全屏 Route 页面 · 引导式 4 步） ============
 // 2026-08-18: 原 TaskEditDialog 弹窗字段多（名称+分类+动作+多参数+Shell+时分+重复+启用），
 // 受 UfiScrollableDialog 82% 屏高约束，启用开关/CTA 易被裁切。改为全屏页面 detail/task-edit?id=...，
-// 由 buildAppScreens 路由映射装配。复用公共组件 UfiScreenScaffold / UfiOptionGrid / UfiDialogTextField /
-// UfiDialogSwitchField / CategoryChip / ScheduleSelector / RuleEditSection，公共组件 0 改动（F24 红线）。
+// 由 buildAppScreens 路由映射装配。
+//
+// 2026-09-21: 全屏长滚动单页 → 引导式 4 步（公共组件 [UfiWizard]）。为什么再改一次：
+//   1. 六组字段一次铺开，用户得读完整页才知道哪几项必填；
+//   2. 保存按钮在标题栏右上角，校验不通过时**静默无反应** —— 原实现是
+//      `if (动作已选 && (非 custom_shell || 命令非空)) { …保存… }`，条件不成立就什么都不做：
+//      没有 toast、按钮也不置灰，用户只看到"点了没反应"。
+// 现在每步只暴露一组字段，「能不能往下走」由 UfiWizardStep.validate 显式回答并给出原因；
+// 保存动作移到向导底部操作栏（末步主按钮），标题栏不再有 ✓ —— 那条静默路径整条删掉了。
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -407,221 +476,237 @@ fun TaskEditScreen(
 ) {
     val state by viewModel.tasksState.collectAsState()
     val isNew = taskId.isBlank()
+    // 深链 / 进程重建时 state.tasks 可能是空的（列表页的 LaunchedEffect 没跑过），本页自己拉一次
+    LaunchedEffect(Unit) { viewModel.tools.loadTaskList() }
     val initial: ScheduledTask = remember(taskId, state.tasks) {
         if (isNew) ScheduledTask()
         else state.tasks.firstOrNull { it.id == taskId } ?: ScheduledTask(id = taskId)
     }
+    /*
+     * 编辑态且列表还没到：渲染加载态，不给保存按钮。
+     *
+     * 否则 initial 退化成空对象、表单一片空白，而保存会把这份空值覆盖到设备上的任务。
+     * 判据带 `!state.tasksLoaded` —— 列表已经成功读过但仍找不到这个 id（被别处删了），
+     * 就按原有兜底走（空表单 + 保留 id），不要在这里卡死。
+     */
+    val awaitingTask = !isNew && state.tasks.none { it.id == taskId } && !state.tasksLoaded
 
-    var name by remember { mutableStateOf(initial.name) }
-    var selectedCategory by remember { mutableStateOf(initial.actionType.let { ActionRegistry.getByType(it)?.category ?: "network" }) }
-    var selectedActionType by remember { mutableStateOf(initial.actionType) }
-    var actionParams by remember { mutableStateOf(initial.params) }
-    var command by remember { mutableStateOf(initial.command) }
+    var currentStep by remember { mutableStateOf(0) }
+    // 字段都跟着 initial 走：列表晚到时（深链）这些 remember 会重建并回填，
+    // 无 key 的 remember 会把空表单一直留在屏幕上（参考 StorageSourceEditScreen 的 remember(source)）
+    var name by remember(initial) { mutableStateOf(initial.name) }
+    var selectedCategory by remember(initial) { mutableStateOf(initial.actionType.let { ActionRegistry.getByType(it)?.category ?: "network" }) }
+    var selectedActionType by remember(initial) { mutableStateOf(initial.actionType) }
+    var actionParams by remember(initial) { mutableStateOf(initial.params) }
+    var command by remember(initial) { mutableStateOf(initial.command) }
     // 执行周期（时间触发）：单一 ScheduleValue 承载 8 preset + 自定义 cron（v9 扩展）
-    var scheduleValue by remember {
+    var scheduleValue by remember(initial) {
         mutableStateOf(if (isNew) ScheduleValue.DEFAULT else initial.toScheduleValue())
     }
-    var enabled by remember { mutableStateOf(initial.enabled) }
+    var enabled by remember(initial) { mutableStateOf(initial.enabled) }
+    var toast by remember { mutableStateOf<ToastMessage?>(null) }
+    var saveDone by remember { mutableStateOf(false) }
+    var submitting by remember { mutableStateOf(false) }
 
-    val categoryActions = ActionRegistry.getByCategory(selectedCategory)
+
+    // 这两个判据同时喂给 validate（决定能否往下走）与字段的 isError（行内标红），
+    // 写成一处才不会出现"按钮灰了但没有哪个字段标红"的错位。
+    fun actionError(): String? = when {
+        selectedActionType.isBlank() -> "请先选择要执行的动作"
+        selectedActionType == "custom_shell" && command.isBlank() -> "自定义命令不能为空"
+        else -> null
+    }
+
+    fun scheduleError(): String? = scheduleValue.let { sv ->
+        when {
+            // 原实现是 `takeIf { isValid }`：非法 cron 被静默丢成 null，任务照样保存成"没有周期"。
+            sv.scheduleType == "custom" && !CronParser.isValid(sv.customCron) ->
+                "自定义 cron 无效，格式为「分 时 日 月 周」，如 30 8 * * 1-5"
+            // 原实现空集合由 CronParser.toCron 兜底成"周一 / 1 日"，等于替用户做了个没说过的决定。
+            sv.scheduleType == "weekly" && sv.weekDays.isEmpty() -> "请至少选择一个星期"
+            sv.scheduleType == "monthly" && sv.monthDays.isEmpty() -> "请至少选择一个日期"
+            else -> null
+        }
+    }
+
+    fun submit() {
+        val sv = scheduleValue
+        // 由结构化选择生成 cron / repeatDaily / scheduleType（v9 时间触发扩展）
+        // 向后兼容：daily 仍走旧 repeatDaily 路径（scheduleType/cron 留空），旧任务可无损回存
+        val (cron: String?, repeatDailyOut: Boolean, scheduleTypeOut: String?) = when (sv.scheduleType) {
+            "daily" -> Triple(null, true, null) // 旧路径：保留 legacy 字段
+            "once" -> Triple(null, false, "once")
+            "custom" -> Triple(sv.customCron, true, "custom") // 合法性已由 scheduleError 拦在前面
+            else -> Triple(
+                CronParser.toCron(sv.scheduleType, sv.hour, sv.minute, sv.weekDays, sv.monthDays, sv.intervalN),
+                true,
+                sv.scheduleType
+            )
+        }
+        val scheduleParams = buildMap<String, JsonPrimitive> {
+            if (sv.weekDays.isNotEmpty()) put("weekDays", JsonPrimitive(sv.weekDays.sorted().joinToString(",")))
+            if (sv.monthDays.isNotEmpty()) put("monthDays", JsonPrimitive(sv.monthDays.sorted().joinToString(",")))
+            put("intervalN", JsonPrimitive(sv.intervalN))
+        }
+        val task = initial.copy(
+            name = name,
+            actionType = selectedActionType,
+            params = actionParams,
+            command = command,
+            hour = sv.hour.coerceIn(0, 23),
+            minute = sv.minute.coerceIn(0, 59),
+            repeatDaily = repeatDailyOut,
+            triggerMode = if (scheduleTypeOut == null) null else "schedule",
+            scheduleType = scheduleTypeOut,
+            cron = cron,
+            scheduleParams = if (scheduleTypeOut == null) emptyMap() else scheduleParams,
+            enabled = enabled
+        )
+        // 成功才 toast + 退页：createTask/updateTask 是 fire-and-forget，
+        // 原来提交完立刻报"已创建"并 pop，网络失败 / 400 时用户看到的是成功提示
+        submitting = true
+        val onDone: (Boolean, String) -> Unit = { ok, msg ->
+            submitting = false
+            toast = ToastMessage(msg, if (ok) ToastType.SUCCESS else ToastType.ERROR)
+            if (ok) saveDone = true
+        }
+        if (isNew) {
+            viewModel.tools.createTask(task, onDone)
+        } else {
+
+            viewModel.tools.updateTask(task.id, task, onDone)
+        }
+    }
+
+
+    // 列表还没到就只给加载态：表单与「保存」一起不出现，比灰着一个按钮更明确
+    if (awaitingTask) {
+        UfiScreenScaffold(title = "编辑任务", navController = navController, showBack = true) { padding ->
+            Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
+                UfiLoadingIndicator()
+            }
+        }
+        return
+    }
 
     UfiScreenScaffold(
         title = if (isNew) "新建任务" else "编辑任务",
         navController = navController,
-        showBack = true,
-        actions = {
-            IconButton(
-                onClick = {
-                    if (selectedActionType.isNotBlank() && (selectedActionType != "custom_shell" || command.isNotBlank())) {
-                        val sv = scheduleValue
-                        // 由结构化选择生成 cron / repeatDaily / scheduleType（v9 时间触发扩展）
-                        // 向后兼容：daily 仍走旧 repeatDaily 路径（scheduleType/cron 留空），旧任务可无损回存
-                        val (cron: String?, repeatDailyOut: Boolean, scheduleTypeOut: String?) = when (sv.scheduleType) {
-                            "daily" -> Triple(null, true, null) // 旧路径：保留 legacy 字段
-                            "once" -> Triple(null, false, "once")
-                            "custom" -> Triple(sv.customCron.takeIf { CronParser.isValid(it) }, true, "custom")
-                            else -> Triple(
-                                CronParser.toCron(sv.scheduleType, sv.hour, sv.minute, sv.weekDays, sv.monthDays, sv.intervalN),
-                                true,
-                                sv.scheduleType
-                            )
-                        }
-                        val scheduleParams = buildMap<String, JsonPrimitive> {
-                            if (sv.weekDays.isNotEmpty()) put("weekDays", JsonPrimitive(sv.weekDays.sorted().joinToString(",")))
-                            if (sv.monthDays.isNotEmpty()) put("monthDays", JsonPrimitive(sv.monthDays.sorted().joinToString(",")))
-                            put("intervalN", JsonPrimitive(sv.intervalN))
-                        }
-                        val task = initial.copy(
-                            name = name,
-                            actionType = selectedActionType,
-                            params = actionParams,
-                            command = command,
-                            hour = sv.hour.coerceIn(0, 23),
-                            minute = sv.minute.coerceIn(0, 59),
-                            repeatDaily = repeatDailyOut,
-                            triggerMode = if (scheduleTypeOut == null) null else "schedule",
-                            scheduleType = scheduleTypeOut,
-                            cron = cron,
-                            scheduleParams = if (scheduleTypeOut == null) emptyMap() else scheduleParams,
-                            enabled = enabled
-                        )
-                        if (isNew) viewModel.tools.createTask(task)
-                        else viewModel.tools.updateTask(task.id, task)
-                        navController.popBackStack()
-                    }
-                }
-            ) {
-                Icon(Icons.Default.Check, "保存")
-            }
-        }
+        showBack = true
     ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
-        ) {
-            // 1. 启用此任务（开关置顶 · 单行卡片，消除双层 label）
-            EnableToggleRow(
-                title = "启用此任务",
-                subtitle = "创建后立即生效，无需手动开启",
-                icon = Icons.Filled.FlashOn,
-                checked = enabled,
-                onCheckedChange = { enabled = it }
-            )
+        Box(modifier = Modifier.fillMaxSize().padding(padding)) {
 
-            // 2. 任务名称
-            RuleEditSection(title = "任务名称") {
-                // 2026-08-31：裸 OutlinedTextField（自带 colorScheme 边框配色）→ 公共 UfiTextField
-                UfiTextField(
-                    value = name,
-                    onValueChange = { name = it },
-                    label = "",
-                    placeholder = "如：每天 8 点重启"
-                )
-            }
-
-            // 3. 执行动作（分类 + 动作双栏选择 + 参数）
-            RuleEditSection(title = "执行动作") {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    // 分类 chips（横排，全屏宽度足够 4 个）
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        modifier = Modifier.fillMaxWidth()
+            UfiWizard(
+                steps = listOf(
+                    UfiWizardStep(
+                        label = "基本信息",
+                        heading = "给任务起个名字",
+                        description = "名称只用于列表展示；留空时列表会显示所选动作名。"
                     ) {
-                        ActionRegistry.categories.forEach { (key, label) ->
-                            CategoryChip(
-                                label = label,
-                                selected = selectedCategory == key,
-                                onClick = {
-                                    selectedCategory = key
-                                    selectedActionType = ActionRegistry.getByCategory(key).firstOrNull()?.type ?: ""
-                                }
+                        Column(verticalArrangement = Arrangement.spacedBy(Spacing.Large)) {
+                            EnableToggleRow(
+                                title = "启用此任务",
+                                subtitle = "创建后立即生效，无需手动开启",
+                                icon = Icons.Filled.FlashOn,
+                                checked = enabled,
+                                onCheckedChange = { enabled = it }
+                            )
+                            UfiDialogTextField(
+                                label = "任务名称",
+                                value = name,
+                                onValueChange = { name = it },
+                                placeholder = "如：每天 8 点重启"
+                            )
+                        }
+                    },
+                    UfiWizardStep(
+                        label = "执行动作",
+                        heading = "任务要做什么",
+                        description = "先选分类，再选具体动作；部分动作还需要补一个参数。",
+                        validate = ::actionError
+                    ) {
+                        ActionPickerSection(
+                            selectedCategory = selectedCategory,
+                            onCategoryChange = { selectedCategory = it },
+                            selectedActionType = selectedActionType,
+                            onActionChange = { selectedActionType = it },
+                            params = actionParams,
+                            onParamsChange = { actionParams = it },
+                            commandValue = command,
+                            onCommandChange = { command = it },
+                            commandError = selectedActionType == "custom_shell" && command.isBlank()
+                        )
+                    },
+                    UfiWizardStep(
+                        label = "执行周期",
+                        heading = "什么时候执行",
+                        description = "选好后，卡片底部会实时算出下一次执行时间。",
+                        validate = ::scheduleError
+                    ) {
+                        // v9：合并「执行时间」+「重复」为单一 ScheduleSelector 公共组件
+                        ScheduleSelector(
+                            scheduleType = scheduleValue.scheduleType,
+                            hour = scheduleValue.hour,
+                            minute = scheduleValue.minute,
+                            weekDays = scheduleValue.weekDays,
+                            monthDays = scheduleValue.monthDays,
+                            intervalN = scheduleValue.intervalN,
+                            customCron = scheduleValue.customCron,
+                            onChange = { scheduleValue = it }
+                        )
+                    },
+                    UfiWizardStep(
+                        label = "确认",
+                        heading = "核对一遍再保存",
+                        description = "需要改动时点「上一步」，或直接点上方步骤条跳到任意一步。"
+                    ) {
+                        val previewCron = CronParser.previewCron(
+                            scheduleValue.scheduleType,
+                            scheduleValue.hour,
+                            scheduleValue.minute,
+                            scheduleValue.weekDays,
+                            scheduleValue.monthDays,
+                            scheduleValue.intervalN,
+                            scheduleValue.customCron
+                        )
+                        Column(verticalArrangement = Arrangement.spacedBy(Spacing.Large)) {
+                            UfiWizardReviewCard(
+                                title = "基本信息",
+                                icon = Icons.Filled.Schedule,
+                                rows = listOf(
+                                    UfiWizardReviewRow("任务名称", name.ifBlank { "未填写" }),
+                                    UfiWizardReviewRow("创建后状态", if (enabled) "启用" else "停用")
+                                )
+                            )
+                            UfiWizardReviewCard(
+                                title = "执行动作",
+                                icon = ActionRegistry.getByType(selectedActionType)?.icon ?: Icons.Filled.Bolt,
+                                rows = actionReviewRows(selectedCategory, selectedActionType, actionParams, command)
+                            )
+                            UfiWizardReviewCard(
+                                title = "执行周期",
+                                icon = Icons.Filled.Event,
+                                rows = listOf(
+                                    UfiWizardReviewRow("周期", scheduleValueSummary(scheduleValue)),
+                                    UfiWizardReviewRow("cron", previewCron ?: "无（按旧字段执行）")
+                                )
                             )
                         }
                     }
-                    // 动作列表（复用公共 UfiOptionGrid 双栏网格，与分类 chips 视觉一脉相承，自动获得按下 0.97 缩放 + 选中过渡）
-                    UfiOptionGrid(
-                        options = categoryActions.map { action ->
-                            UfiOptionItem(
-                                value = action.type,
-                                label = action.name,
-                                leading = {
-                                    Icon(
-                                        imageVector = action.icon,
-                                        contentDescription = null,
-                                        tint = LocalResolvedPalette.current.accent,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                }
-                            )
-                        },
-                        selectedValue = selectedActionType,
-                        onSelect = { type ->
-                            selectedActionType = type
-                            actionParams = ActionRegistry.getByType(type)?.params
-                                ?.associate { it.key to it.default } ?: emptyMap()
-                        },
-                        columns = 2
-                    )
-                    // 动作参数（按所选动作动态渲染，AnimatedContent 平滑过渡）
-                    AnimatedContent(
-                        targetState = selectedActionType,
-                        transitionSpec = {
-                            (fadeIn(tween(UfiMotion.Duration.Standard)) + slideInVertically { it / 8 })
-                                .togetherWith(fadeOut(tween(UfiMotion.Duration.Swift)) + slideOutVertically { -it / 8 })
-                        },
-                        label = "taskActionParams"
-                    ) { actionType ->
-                        val def = ActionRegistry.getByType(actionType)
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            def?.params?.forEach { param ->
-                                when (param.type) {
-                                    ParamType.BOOLEAN -> {
-                                        val currentValue = actionParams[param.key]?.content?.toBoolean()
-                                            ?: (param.default.content.toBoolean())
-                                        UfiDialogSwitchField(param.label, currentValue) {
-                                            actionParams = actionParams + (param.key to JsonPrimitive(it))
-                                        }
-                                    }
-                                    ParamType.STRING -> {
-                                        if (param.key == "command") {
-                                            UfiDialogTextField(
-                                                label = param.label,
-                                                value = command,
-                                                onValueChange = {
-                                                    command = it
-                                                    actionParams = actionParams + (param.key to JsonPrimitive(it))
-                                                },
-                                                placeholder = "输入 Shell 命令",
-                                                singleLine = false
-                                            )
-                                        } else param.options?.let { opts ->
-                                            val currentValue = actionParams[param.key]?.content ?: param.default.content
-                                            UfiDialogField(param.label) {
-                                                UfiOptionGrid(
-                                                    options = opts.map { (value, label) -> UfiOptionItem(value = value, label = label) },
-                                                    selectedValue = currentValue,
-                                                    onSelect = { actionParams = actionParams + (param.key to JsonPrimitive(it)) },
-                                                    columns = opts.size.coerceAtMost(3)
-                                                )
-                                            }
-                                        }
-                                    }
-                                    ParamType.INT -> {
-                                        param.options?.let { opts ->
-                                            val currentValue = actionParams[param.key]?.content ?: param.default.content
-                                            UfiDialogField(param.label) {
-                                                UfiOptionGrid(
-                                                    options = opts.map { (value, label) -> UfiOptionItem(value = value, label = label) },
-                                                    selectedValue = currentValue,
-                                                    onSelect = { actionParams = actionParams + (param.key to JsonPrimitive(it)) },
-                                                    columns = opts.size.coerceAtMost(3)
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+                ),
+                currentStep = currentStep,
+                onStepChange = { currentStep = it },
+                onFinish = { submit() },
+                finishText = if (isNew) "创建任务" else "保存修改",
+                finishLoading = submitting,
+                onStepBlocked = { toast = ToastMessage(it, ToastType.WARNING) }
 
-            // 4+5. 执行周期（v9：合并「执行时间」+「重复」为单一 ScheduleSelector 公共组件）
-            ScheduleSelector(
-                scheduleType = scheduleValue.scheduleType,
-                hour = scheduleValue.hour,
-                minute = scheduleValue.minute,
-                weekDays = scheduleValue.weekDays,
-                monthDays = scheduleValue.monthDays,
-                intervalN = scheduleValue.intervalN,
-                customCron = scheduleValue.customCron,
-                onChange = { scheduleValue = it }
             )
+            UfiToastHost(toastMessage = toast, onDismiss = { toast = null })
         }
+        // 先让 toast 挂出去再退页：UfiToastHost 的 effect 与本 effect 同批派发、按声明顺序执行，
+        // 而 toast 卡片是 add 到 Activity 的 decorView（脱离 Compose 树），所以 pop 掉本页也不会带走它。
+        LaunchedEffect(saveDone) { if (saveDone) navController.popBackStack() }
     }
 }
 
@@ -643,6 +728,44 @@ private data class RuleTriggerDef(
     val name: String,
     val icon: ImageVector,
     val hint: String
+)
+
+/**
+ * 自动化规则模板（2026-10-05，与 web tasksShared.ruleTemplates 同一套默认值）。
+ * 新建规则时第一步可一键套用，把触发+动作预填进向导各步，用户只需微调阈值。
+ * 提交路径与手工创建完全一致（POST /api/rules），core 侧零改动。
+ */
+private data class RuleTemplate(
+    val label: String,
+    val desc: String,
+    val triggerType: String,
+    val triggerParams: Map<String, String>,
+    val actionType: String,
+    val params: Map<String, String>,
+    val enabledParam: Boolean? = null
+)
+
+private val RULE_TEMPLATES = listOf(
+    RuleTemplate(
+        label = "流量超限关数据", desc = "当月累计流量达 30GB 时自动关闭移动数据",
+        triggerType = "traffic_total_reached", triggerParams = mapOf("thresholdBytes" to (30L * 1024 * 1024 * 1024).toString()),
+        actionType = "data_toggle", params = emptyMap(), enabledParam = false
+    ),
+    RuleTemplate(
+        label = "低电量省电", desc = "电量低于 20%（未充电）时关数据、关指示灯",
+        triggerType = "battery_below", triggerParams = mapOf("levelPercent" to "20"),
+        actionType = "data_toggle", params = emptyMap(), enabledParam = false
+    ),
+    RuleTemplate(
+        label = "回落 4G 锁回 5G", desc = "网络从 5G 跳变到 4G 时自动把网络模式切回 5G/4G",
+        triggerType = "network_type_changed", triggerParams = mapOf("targetType" to "4G"),
+        actionType = "network_mode", params = mapOf("mode" to "LTE_AND_5G")
+    ),
+    RuleTemplate(
+        label = "断网自动重启", desc = "蜂窝网络断开并确认后自动重启设备（冷却 10 分钟）",
+        triggerType = "disconnect", triggerParams = emptyMap(),
+        actionType = "reboot", params = emptyMap()
+    )
 )
 
 private val RULE_TRIGGERS = listOf(
@@ -754,16 +877,26 @@ private fun RuleLogDialog(rule: AutomationRule, logs: List<ExecutionLog>, onDism
                 }
             }
         }
-        UfiDialogActions(onDismiss = onDismiss, onConfirm = onDismiss, confirmText = "关闭", dismissText = null)
+        UfiDialogActions(
+            onDismiss = onDismiss,
+            onConfirm = onDismiss,
+            confirmText = "关闭",
+            dismissText = null,
+            topSpacing = Spacing.Large
+        )
     }
 }
 
-// ============ 条件规则编辑器（全屏 Route 页面） ============
+// ============ 条件规则编辑器（全屏 Route 页面 · 引导式 4 步） ============
 // 2026-08-18：弹窗字段太多（名称+触发+触发参数+动作+动作参数+启用），
 // UfiScrollableDialog 即便带滚动也仍被横竖挤（5 个触发 chip 横排被裁、Shell 命令框被裁）。
 // 改为全屏页面 detail/rule-edit?id=…，由 [com.ufi_axis.app.navigation.buildAppScreens] 路由映射装配。
-// 复用公共组件 UfiScreenScaffold / UfiOptionGrid / UfiDialogTextField / UfiDialogSwitchField / CategoryChip，
-// 公共组件 0 改动（F24 红线）。
+//
+// 2026-09-21：与 [TaskEditScreen] 一起改成引导式 4 步（公共组件 [UfiWizard]）。
+// 本页原来还多一个毛病：三个阈值输入框（流量 GB / RSRP / 电量 %）是**裸文本框**，
+// 既没有输入过滤也没有 isError —— 输入「abc」会在提交时被静默回落成 1GB / -110 / 20%，
+// 用户毫无察觉；也不校验范围（可以存下 levelPercent = 999）。
+// 现在这三个值由 triggerError 统一判定：非法时字段标红、底部给出原因、「下一步」置灰。
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -774,32 +907,69 @@ fun RuleEditScreen(
 ) {
     val state by viewModel.tasksState.collectAsState()
     val isNew = ruleId.isBlank()
+    // 深链 / 进程重建时 state.rules 可能是空的（列表页的 LaunchedEffect 没跑过），本页自己拉一次
+    LaunchedEffect(Unit) { viewModel.tools.loadRuleList() }
     // id 命中取已有规则；未命中或为空=新建。后端会自动给空 id 生成 8 字符 id（POST /rules）。
     val initial: AutomationRule = remember(ruleId, state.rules) {
         if (isNew) AutomationRule()
         else state.rules.firstOrNull { it.id == ruleId } ?: AutomationRule(id = ruleId)
     }
+    // 编辑态且列表还没到：见 [TaskEditScreen] 同名判据的说明
+    val awaitingRule = !isNew && state.rules.none { it.id == ruleId } && !state.rulesLoaded
 
-    // 表单 state —— 规则未变时跟随 initial 编辑态
-    var name by remember { mutableStateOf(initial.name) }
-    var selectedTrigger by remember { mutableStateOf(initial.triggerType) }
-    var trafficGb by remember {
+    // 表单 state —— 全部跟着 initial 走，列表晚到时会重建并回填
+    var currentStep by remember { mutableStateOf(0) }
+    var name by remember(initial) { mutableStateOf(initial.name) }
+    var selectedTrigger by remember(initial) { mutableStateOf(initial.triggerType) }
+    var trafficGb by remember(initial) {
         mutableStateOf(initial.triggerParams["thresholdBytes"]?.content?.toLongOrNull()
             ?.let { it / (1024.0 * 1024 * 1024) }
             ?.let { String.format(Locale.US, "%.2f", it) } ?: "1.00")
     }
-    var rsrp by remember { mutableStateOf(initial.triggerParams["rsrp"]?.content ?: "-110") }
-    var batteryLevel by remember { mutableStateOf(initial.triggerParams["levelPercent"]?.content ?: "20") }
-    var targetType by remember { mutableStateOf(initial.triggerParams["targetType"]?.content ?: "4G") }
-    var selectedCategory by remember {
+    var rsrp by remember(initial) { mutableStateOf(initial.triggerParams["rsrp"]?.content ?: "-110") }
+    var batteryLevel by remember(initial) { mutableStateOf(initial.triggerParams["levelPercent"]?.content ?: "20") }
+    var targetType by remember(initial) { mutableStateOf(initial.triggerParams["targetType"]?.content ?: "4G") }
+    var selectedCategory by remember(initial) {
         mutableStateOf(initial.actionType.let { ActionRegistry.getByType(it)?.category ?: "network" })
     }
-    var selectedActionType by remember { mutableStateOf(initial.actionType) }
-    var actionParams by remember { mutableStateOf(initial.params) }
-    var enabled by remember { mutableStateOf(initial.enabled) }
+    var selectedActionType by remember(initial) { mutableStateOf(initial.actionType) }
+    var actionParams by remember(initial) { mutableStateOf(initial.params) }
+    var enabled by remember(initial) { mutableStateOf(initial.enabled) }
+    var toast by remember { mutableStateOf<ToastMessage?>(null) }
+    var saveDone by remember { mutableStateOf(false) }
+    var submitting by remember { mutableStateOf(false) }
 
-    val categoryActions = ActionRegistry.getByCategory(selectedCategory)
 
+    val triggerDef = RULE_TRIGGERS.firstOrNull { it.type == selectedTrigger }
+    val palette = LocalResolvedPalette.current
+
+    /** 当前触发条件的参数是否可用；同时喂给 validate 与对应输入框的 isError。 */
+    fun triggerError(): String? = when (selectedTrigger) {
+        "traffic_total_reached" -> {
+            val v = trafficGb.toDoubleOrNull()
+            if (v == null || v <= 0) "流量阈值需为大于 0 的数字（单位 GB）" else null
+        }
+        "signal_below" -> {
+            val v = rsrp.toIntOrNull()
+            if (v == null || v < RSRP_MIN_DBM || v > RSRP_MAX_DBM)
+                "RSRP 阈值需在 $RSRP_MIN_DBM ~ $RSRP_MAX_DBM dBm 之间（负值）" else null
+        }
+        "battery_below" -> {
+            val v = batteryLevel.toIntOrNull()
+            if (v == null || v !in 1..100) "电量阈值需为 1 ~ 100 的整数" else null
+        }
+        "network_type_changed" -> if (targetType.isBlank()) "请选择目标网络类型" else null
+        else -> null
+    }
+
+    fun actionError(): String? = when {
+        selectedActionType.isBlank() -> "请先选择要执行的动作"
+        selectedActionType == "custom_shell" && actionParams["command"]?.content.isNullOrBlank() ->
+            "自定义命令不能为空"
+        else -> null
+    }
+
+    // 兜底值只在"理论上到不了"的路径上生效：向导保证走到末步时 triggerError() 已为 null。
     fun buildTriggerParams(): Map<String, JsonPrimitive> = when (selectedTrigger) {
         "traffic_total_reached" -> mapOf("thresholdBytes" to JsonPrimitive(
             (trafficGb.toDoubleOrNull()?.times(1024 * 1024 * 1024)?.toLong() ?: 1_073_741_824L)
@@ -810,239 +980,390 @@ fun RuleEditScreen(
         else -> emptyMap()
     }
 
+    fun buildRule(): AutomationRule = initial.copy(
+        name = name,
+        triggerType = selectedTrigger,
+        triggerParams = buildTriggerParams(),
+        actionType = selectedActionType,
+        params = actionParams,
+        enabled = enabled
+    )
+
+    // 列表还没到就只给加载态：见 [TaskEditScreen]
+    if (awaitingRule) {
+        UfiScreenScaffold(title = "编辑规则", navController = navController, showBack = true) { padding ->
+            Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
+                UfiLoadingIndicator()
+            }
+        }
+        return
+    }
+
     UfiScreenScaffold(
         title = if (isNew) "新建规则" else "编辑规则",
         navController = navController,
-        showBack = true,
-        actions = {
-            // 保存按钮（TopAppBar 右上）
-            IconButton(
-                onClick = {
-                    if (selectedActionType.isNotBlank()) {
-                        val rule = initial.copy(
-                            name = name,
-                            triggerType = selectedTrigger,
-                            triggerParams = buildTriggerParams(),
-                            actionType = selectedActionType,
-                            params = actionParams,
-                            enabled = enabled
-                        )
-                        if (isNew) viewModel.tools.createRule(rule)
-                        else viewModel.tools.updateRule(rule.id, rule)
-                        navController.popBackStack()
-                    }
-                }
-            ) {
-                Icon(Icons.Default.Check, "保存")
-            }
-        }
+        showBack = true
     ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
-        ) {
-            // 1. 启用此规则（开关置顶 · 单行卡片，消除双层 label）
-            EnableToggleRow(
-                title = "启用此规则",
-                subtitle = "规则创建后立即生效",
-                icon = Icons.Filled.FlashOn,
-                checked = enabled,
-                onCheckedChange = { enabled = it }
-            )
+        Box(modifier = Modifier.fillMaxSize().padding(padding)) {
 
-            // 2. 规则名称
-            RuleEditSection(title = "规则名称") {
-                // 2026-08-31：裸 OutlinedTextField（自带 colorScheme 边框配色）→ 公共 UfiTextField
-                UfiTextField(
-                    value = name,
-                    onValueChange = { name = it },
-                    label = "",
-                    placeholder = "如：流量超 1GB 关数据"
-                )
-            }
-
-            // 3. 当…触发条件（2 列 grid，每项带 hint）
-            RuleEditSection(title = "当… 触发条件") {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    // 5 项触发条件 → 复用公共 UfiOptionGrid 双栏网格（40dp 标准 cell，扁平轻盈，自动获得按下 0.97 缩放 + 选中过渡）
-                    UfiOptionGrid(
-                        options = RULE_TRIGGERS.map { t ->
-                            UfiOptionItem(
-                                value = t.type,
-                                label = t.name,
-                                leading = {
-                                    Icon(
-                                        imageVector = t.icon,
-                                        contentDescription = null,
-                                        tint = LocalResolvedPalette.current.accent,
-                                        modifier = Modifier.size(18.dp)
-                                    )
+            UfiWizard(
+                steps = listOf(
+                    UfiWizardStep(
+                        label = "基本信息",
+                        heading = "给规则起个名字",
+                        description = "名称只用于列表展示；留空时列表会显示「当 … 就 …」的摘要。"
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(Spacing.Large)) {
+                            EnableToggleRow(
+                                title = "启用此规则",
+                                subtitle = "规则创建后立即生效",
+                                icon = Icons.Filled.FlashOn,
+                                checked = enabled,
+                                onCheckedChange = { enabled = it }
+                            )
+                            UfiDialogTextField(
+                                label = "规则名称",
+                                value = name,
+                                onValueChange = { name = it },
+                                placeholder = "如：流量超 1GB 关数据"
+                            )
+                            if (isNew) {
+                                // ── 规则模板（2026-10-05）：一键预填触发+动作，后续步骤微调即可 ──
+                                Spacer(Modifier.height(4.dp))
+                                Text("从模板开始", style = MaterialTheme.typography.labelMedium,
+                                    color = palette.textSecondary)
+                                RULE_TEMPLATES.forEach { tpl ->
+                                    Surface(
+                                        onClick = {
+                                            name = tpl.label
+                                            selectedTrigger = tpl.triggerType
+                                            when (tpl.triggerType) {
+                                                "traffic_total_reached" ->
+                                                    trafficGb = tpl.triggerParams["thresholdBytes"]
+                                                        ?.toLongOrNull()
+                                                        ?.let { String.format(Locale.US, "%.2f", it / (1024.0 * 1024 * 1024)) }
+                                                        ?: trafficGb
+                                                "signal_below" -> rsrp = tpl.triggerParams["rsrp"] ?: rsrp
+                                                "battery_below" -> batteryLevel = tpl.triggerParams["levelPercent"] ?: batteryLevel
+                                                "network_type_changed" -> targetType = tpl.triggerParams["targetType"] ?: targetType
+                                            }
+                                            selectedActionType = tpl.actionType
+                                            selectedCategory = ActionRegistry.getByType(tpl.actionType)?.category ?: selectedCategory
+                                            actionParams = buildMap {
+                                                tpl.params.forEach { (k, v) -> put(k, JsonPrimitive(v)) }
+                                                if (tpl.enabledParam != null) put("enabled", JsonPrimitive(tpl.enabledParam))
+                                            }
+                                            toast = ToastMessage("已套用模板「" + tpl.label + "」，可在后续步骤微调")
+                                        },
+                                        color = palette.cardBg,
+                                        shape = UfiCardDefaults.microShape,
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Column(Modifier.padding(12.dp)) {
+                                            Text(tpl.label, style = UfiTextStyles.bodyEmphasis)
+                                            Spacer(Modifier.height(2.dp))
+                                            Text(tpl.desc, style = MaterialTheme.typography.bodySmall,
+                                                color = palette.textSecondary)
+                                        }
+                                    }
                                 }
+                            }
+                        }
+                    },
+                    UfiWizardStep(
+                        label = "触发条件",
+                        heading = "什么情况下触发",
+                        description = "选一个条件；除「断网」外都需要填一个阈值。",
+                        validate = ::triggerError
+                    ) {
+                        val error = triggerError()
+                        Column(verticalArrangement = Arrangement.spacedBy(Spacing.Medium)) {
+                            // 5 项触发条件 → 公共 UfiOptionGrid 双栏网格（自动带按下缩放 + 选中过渡）
+                            UfiOptionGrid(
+                                options = RULE_TRIGGERS.map { t ->
+                                    UfiOptionItem(
+                                        value = t.type,
+                                        label = t.name,
+                                        leading = {
+                                            Icon(
+                                                imageVector = t.icon,
+                                                contentDescription = null,
+                                                tint = LocalResolvedPalette.current.accent,
+                                                modifier = Modifier.size(Spacing.IconSizeSmall)
+                                            )
+                                        }
+                                    )
+                                },
+                                selectedValue = selectedTrigger,
+                                onSelect = { selectedTrigger = it },
+                                columns = 2
                             )
-                        },
-                        selectedValue = selectedTrigger,
-                        onSelect = { selectedTrigger = it },
-                        columns = 2
-                    )
-                    // 当前触发条件的内联参数
-                    when (selectedTrigger) {
-                        "traffic_total_reached" ->
-                            UfiDialogTextField(
-                                label = "流量阈值 (GB)",
-                                value = trafficGb,
-                                onValueChange = { trafficGb = it },
-                                placeholder = "如 1",
-                                singleLine = true
-                            )
-                        "signal_below" ->
-                            UfiDialogTextField(
-                                label = "RSRP 阈值 (dBm，负值越小越差)",
-                                value = rsrp,
-                                onValueChange = { rsrp = it },
-                                placeholder = "如 -110",
-                                singleLine = true
-                            )
-                        "battery_below" ->
-                            UfiDialogTextField(
-                                label = "电量阈值 (%)，未充电时生效",
-                                value = batteryLevel,
-                                onValueChange = { batteryLevel = it },
-                                placeholder = "如 20",
-                                singleLine = true
-                            )
-                        "network_type_changed" ->
-                            UfiDialogField("变为目标网络类型") {
-                                UfiOptionGrid(
-                                    options = listOf("4G", "5G", "3G", "2G", "WiFi").map {
-                                        UfiOptionItem(value = it, label = it)
-                                    },
-                                    selectedValue = targetType,
-                                    onSelect = { targetType = it },
-                                    columns = 3
+                            triggerDef?.let {
+                                Text(
+                                    it.hint,
+                                    style = UfiTextStyles.note,
+                                    color = LocalResolvedPalette.current.textSecondary
                                 )
                             }
-                        "disconnect" -> Text(
-                            "蜂窝网络断开的瞬间触发，无需额外参数。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = LocalResolvedPalette.current.textSecondary
-                        )
-                    }
-                }
-            }
-
-            // 4. 就… 执行动作
-            RuleEditSection(title = "就… 执行动作") {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    // 分类 chips（横排，不裁——全屏宽度足够 4 个）
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        modifier = Modifier.fillMaxWidth()
+                            // 当前触发条件的内联参数
+                            when (selectedTrigger) {
+                                "traffic_total_reached" ->
+                                    UfiDialogTextField(
+                                        label = "流量阈值 (GB)",
+                                        value = trafficGb,
+                                        onValueChange = { trafficGb = it },
+                                        placeholder = "如 1",
+                                        singleLine = true,
+                                        isError = error != null,
+                                        errorMessage = error
+                                    )
+                                "signal_below" ->
+                                    UfiDialogTextField(
+                                        label = "RSRP 阈值 (dBm，负值越小越差)",
+                                        value = rsrp,
+                                        onValueChange = { rsrp = it },
+                                        placeholder = "如 -110",
+                                        singleLine = true,
+                                        isError = error != null,
+                                        errorMessage = error
+                                    )
+                                "battery_below" ->
+                                    UfiDialogTextField(
+                                        label = "电量阈值 (%)，未充电时生效",
+                                        value = batteryLevel,
+                                        onValueChange = { batteryLevel = it },
+                                        placeholder = "如 20",
+                                        singleLine = true,
+                                        isError = error != null,
+                                        errorMessage = error
+                                    )
+                                "network_type_changed" ->
+                                    UfiDialogField("变为目标网络类型") {
+                                        UfiOptionGrid(
+                                            options = NETWORK_TARGET_TYPES.map {
+                                                UfiOptionItem(value = it, label = it)
+                                            },
+                                            selectedValue = targetType,
+                                            onSelect = { targetType = it },
+                                            columns = 3
+                                        )
+                                    }
+                            }
+                        }
+                    },
+                    UfiWizardStep(
+                        label = "执行动作",
+                        heading = "触发后做什么",
+                        description = "先选分类，再选具体动作；部分动作还需要补一个参数。",
+                        validate = ::actionError
                     ) {
-                        ActionRegistry.categories.forEach { (key, label) ->
-                            CategoryChip(
-                                label = label,
-                                selected = selectedCategory == key,
-                                onClick = {
-                                    selectedCategory = key
-                                    selectedActionType = ActionRegistry.getByCategory(key).firstOrNull()?.type ?: ""
-                                }
+                        ActionPickerSection(
+                            selectedCategory = selectedCategory,
+                            onCategoryChange = { selectedCategory = it },
+                            selectedActionType = selectedActionType,
+                            onActionChange = { selectedActionType = it },
+                            params = actionParams,
+                            onParamsChange = { actionParams = it },
+                            commandValue = actionParams["command"]?.content ?: "",
+                            onCommandChange = { actionParams = actionParams + ("command" to JsonPrimitive(it)) },
+                            commandError = selectedActionType == "custom_shell" &&
+                                actionParams["command"]?.content.isNullOrBlank()
+                        )
+                    },
+                    UfiWizardStep(
+                        label = "确认",
+                        heading = "核对一遍再保存",
+                        description = "需要改动时点「上一步」，或直接点上方步骤条跳到任意一步。"
+                    ) {
+                        val draft = buildRule()
+                        val actionName = ActionRegistry.getByType(selectedActionType)?.name ?: selectedActionType
+                        Column(verticalArrangement = Arrangement.spacedBy(Spacing.Large)) {
+                            UfiWizardReviewCard(
+                                title = "基本信息",
+                                icon = Icons.Filled.AutoAwesome,
+                                rows = listOf(
+                                    UfiWizardReviewRow("规则名称", name.ifBlank { "未填写" }),
+                                    UfiWizardReviewRow("创建后状态", if (enabled) "启用" else "停用"),
+                                    UfiWizardReviewRow("摘要", "当 ${ruleTriggerSummary(draft)}，就 $actionName")
+                                )
+                            )
+                            UfiWizardReviewCard(
+                                title = "触发条件",
+                                icon = triggerDef?.icon ?: Icons.Filled.Bolt,
+                                rows = triggerReviewRows(
+                                    triggerType = selectedTrigger,
+                                    triggerName = triggerDef?.name ?: selectedTrigger,
+                                    trafficGb = trafficGb,
+                                    rsrp = rsrp,
+                                    batteryLevel = batteryLevel,
+                                    targetType = targetType
+                                )
+                            )
+                            UfiWizardReviewCard(
+                                title = "执行动作",
+                                icon = ActionRegistry.getByType(selectedActionType)?.icon ?: Icons.Filled.Bolt,
+                                rows = actionReviewRows(
+                                    category = selectedCategory,
+                                    actionType = selectedActionType,
+                                    params = actionParams,
+                                    command = actionParams["command"]?.content ?: ""
+                                )
                             )
                         }
                     }
-                    // 动作列表（复用公共 UfiOptionGrid 双栏网格，与分类 chips 视觉一脉相承，自动获得按下 0.97 缩放 + 选中过渡）
-                    UfiOptionGrid(
-                        options = categoryActions.map { action ->
-                            UfiOptionItem(
-                                value = action.type,
-                                label = action.name,
-                                leading = {
-                                    Icon(
-                                        imageVector = action.icon,
-                                        contentDescription = null,
-                                        tint = LocalResolvedPalette.current.accent,
-                                        modifier = Modifier.size(18.dp)
+                ),
+                currentStep = currentStep,
+                onStepChange = { currentStep = it },
+                onFinish = {
+                    val rule = buildRule()
+                    // 成功才 toast + 退页（理由同 TaskEditScreen.submit）
+                    submitting = true
+                    val onDone: (Boolean, String) -> Unit = { ok, msg ->
+                        submitting = false
+                        toast = ToastMessage(msg, if (ok) ToastType.SUCCESS else ToastType.ERROR)
+                        if (ok) saveDone = true
+                    }
+                    if (isNew) {
+                        viewModel.tools.createRule(rule, onDone)
+                    } else {
+                        viewModel.tools.updateRule(rule.id, rule, onDone)
+                    }
+                },
+                finishText = if (isNew) "创建规则" else "保存修改",
+                finishLoading = submitting,
+                onStepBlocked = { toast = ToastMessage(it, ToastType.WARNING) }
+
+            )
+            UfiToastHost(toastMessage = toast, onDismiss = { toast = null })
+        }
+        LaunchedEffect(saveDone) { if (saveDone) navController.popBackStack() }
+    }
+}
+
+/**
+ * 「执行动作」选择块：分类 chips + 动作网格 + 动作参数。
+ *
+ * 2026-09-21：定时任务与条件规则原先各有一份**逐行相同**的实现（约 70 行 × 2），
+ * 改引导式时合并到这里。两边唯一的差别是 custom_shell 的命令值存在哪：
+ * 任务有独立的 `command` 字段，规则只存在 params 里 —— 由 [commandValue] / [onCommandChange] 表达。
+ *
+ * 顺带修掉一处原有的漏重置：原实现切换**分类**时只改 actionType，不重置 params，
+ * 于是上一个动作的参数会残留在新动作的 params 里（后端按 key 取值，多余 key 被忽略，
+ * 但"看不见的旧值"会跟着任务一起存盘）。现在切分类与切动作都落到同一套重置逻辑。
+ */
+@Composable
+private fun ActionPickerSection(
+    selectedCategory: String,
+    onCategoryChange: (String) -> Unit,
+    selectedActionType: String,
+    onActionChange: (String) -> Unit,
+    params: Map<String, JsonPrimitive>,
+    onParamsChange: (Map<String, JsonPrimitive>) -> Unit,
+    commandValue: String,
+    onCommandChange: (String) -> Unit,
+    commandError: Boolean
+) {
+    val palette = LocalResolvedPalette.current
+    val categoryActions = ActionRegistry.getByCategory(selectedCategory)
+
+    /** 选中某个动作：同时把参数重置为该动作的默认值。 */
+    fun selectAction(type: String) {
+        onActionChange(type)
+        onParamsChange(
+            ActionRegistry.getByType(type)?.params?.associate { it.key to it.default } ?: emptyMap()
+        )
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(Spacing.Large)) {
+        // 分类 chips（横排，全屏宽度足够 4 个）
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(Spacing.Medium),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            ActionRegistry.categories.forEach { (key, label) ->
+                CategoryChip(
+                    label = label,
+                    selected = selectedCategory == key,
+                    onClick = {
+                        onCategoryChange(key)
+                        selectAction(ActionRegistry.getByCategory(key).firstOrNull()?.type ?: "")
+                    }
+                )
+            }
+        }
+        // 动作列表（公共 UfiOptionGrid 双栏网格，与分类 chips 视觉一脉相承）
+        UfiOptionGrid(
+            options = categoryActions.map { action ->
+                UfiOptionItem(
+                    value = action.type,
+                    label = action.name,
+                    leading = {
+                        Icon(
+                            imageVector = action.icon,
+                            contentDescription = null,
+                            tint = palette.accent,
+                            modifier = Modifier.size(Spacing.IconSizeSmall)
+                        )
+                    }
+                )
+            },
+            selectedValue = selectedActionType,
+            onSelect = { selectAction(it) },
+            columns = 2
+        )
+        // 动作参数（按所选动作动态渲染，AnimatedContent 平滑过渡）
+        AnimatedContent(
+            targetState = selectedActionType,
+            transitionSpec = {
+                (fadeIn(tween(UfiMotion.Duration.Standard)) + slideInVertically { it / PARAM_SLIDE_DIVISOR })
+                    .togetherWith(fadeOut(tween(UfiMotion.Duration.Swift)) + slideOutVertically { -it / PARAM_SLIDE_DIVISOR })
+            },
+            label = "actionParams"
+        ) { actionType ->
+            val def = ActionRegistry.getByType(actionType)
+            Column(verticalArrangement = Arrangement.spacedBy(Spacing.Medium)) {
+                def?.params?.forEach { param ->
+                    when (param.type) {
+                        ParamType.BOOLEAN -> {
+                            val currentValue = params[param.key]?.content?.toBoolean()
+                                ?: param.default.content.toBoolean()
+                            UfiDialogSwitchField(param.label, currentValue) {
+                                onParamsChange(params + (param.key to JsonPrimitive(it)))
+                            }
+                        }
+                        ParamType.STRING -> {
+                            if (param.key == "command") {
+                                UfiDialogTextField(
+                                    label = param.label,
+                                    value = commandValue,
+                                    onValueChange = onCommandChange,
+                                    placeholder = "输入 Shell 命令",
+                                    singleLine = false,
+                                    isError = commandError,
+                                    errorMessage = if (commandError) "命令不能为空" else null
+                                )
+                            } else param.options?.let { opts ->
+                                val currentValue = params[param.key]?.content ?: param.default.content
+                                UfiDialogField(param.label) {
+                                    UfiOptionGrid(
+                                        options = opts.map { (value, label) -> UfiOptionItem(value = value, label = label) },
+                                        selectedValue = currentValue,
+                                        onSelect = { onParamsChange(params + (param.key to JsonPrimitive(it))) },
+                                        columns = opts.size.coerceAtMost(3)
                                     )
                                 }
-                            )
-                        },
-                        selectedValue = selectedActionType,
-                        onSelect = { type ->
-                            selectedActionType = type
-                            actionParams = ActionRegistry.getByType(type)?.params
-                                ?.associate { it.key to it.default } ?: emptyMap()
-                        },
-                        columns = 2
-                    )
-                    // 动作参数（按所选动作动态渲染，AnimatedContent 平滑过渡）
-                    AnimatedContent(
-                        targetState = selectedActionType,
-                        transitionSpec = {
-                            (fadeIn(tween(UfiMotion.Duration.Standard)) + slideInVertically { it / 8 })
-                                .togetherWith(fadeOut(tween(UfiMotion.Duration.Swift)) + slideOutVertically { -it / 8 })
-                        },
-                        label = "ruleActionParams"
-                    ) { actionType ->
-                        val def = ActionRegistry.getByType(actionType)
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            def?.params?.forEach { param ->
-                                when (param.type) {
-                                    ParamType.BOOLEAN -> {
-                                        val currentValue = actionParams[param.key]?.content?.toBoolean()
-                                            ?: (param.default.content.toBoolean())
-                                        UfiDialogSwitchField(param.label, currentValue) {
-                                            actionParams = actionParams + (param.key to JsonPrimitive(it))
-                                        }
-                                    }
-                                    ParamType.STRING -> {
-                                        if (param.key == "command") {
-                                            UfiDialogTextField(
-                                                label = param.label,
-                                                value = actionParams[param.key]?.content ?: "",
-                                                onValueChange = {
-                                                    actionParams = actionParams + (param.key to JsonPrimitive(it))
-                                                },
-                                                placeholder = "输入内容",
-                                                singleLine = false
-                                            )
-                                        } else param.options?.let { opts ->
-                                            val currentValue = actionParams[param.key]?.content
-                                                ?: param.default.content
-                                            UfiDialogField(param.label) {
-                                                UfiOptionGrid(
-                                                    options = opts.map { (value, label) ->
-                                                        UfiOptionItem(value = value, label = label)
-                                                    },
-                                                    selectedValue = currentValue,
-                                                    onSelect = {
-                                                        actionParams = actionParams + (param.key to JsonPrimitive(it))
-                                                    },
-                                                    columns = opts.size.coerceAtMost(3)
-                                                )
-                                            }
-                                        }
-                                    }
-                                    ParamType.INT -> {
-                                        param.options?.let { opts ->
-                                            val currentValue = actionParams[param.key]?.content
-                                                ?: param.default.content
-                                            UfiDialogField(param.label) {
-                                                UfiOptionGrid(
-                                                    options = opts.map { (value, label) ->
-                                                        UfiOptionItem(value = value, label = label)
-                                                    },
-                                                    selectedValue = currentValue,
-                                                    onSelect = {
-                                                        actionParams = actionParams + (param.key to JsonPrimitive(it))
-                                                    },
-                                                    columns = opts.size.coerceAtMost(3)
-                                                )
-                                            }
-                                        }
-                                    }
+                            }
+                        }
+                        ParamType.INT -> {
+                            param.options?.let { opts ->
+                                val currentValue = params[param.key]?.content ?: param.default.content
+                                UfiDialogField(param.label) {
+                                    UfiOptionGrid(
+                                        options = opts.map { (value, label) -> UfiOptionItem(value = value, label = label) },
+                                        selectedValue = currentValue,
+                                        onSelect = { onParamsChange(params + (param.key to JsonPrimitive(it))) },
+                                        columns = opts.size.coerceAtMost(3)
+                                    )
                                 }
                             }
                         }
@@ -1053,25 +1374,51 @@ fun RuleEditScreen(
     }
 }
 
-/** 全屏编辑器段落容器（与详情页 segment card 视觉一致）。 */
-@Composable
-private fun RuleEditSection(title: String, content: @Composable () -> Unit) {
-    val palette = LocalResolvedPalette.current
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(UfiCardDefaults.mediumShape)
-            .background(palette.cardBg)
-            .border(1.dp, palette.divider, UfiCardDefaults.mediumShape)
-            .padding(14.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        Text(
-            text = title,
-            style = UfiTextStyles.cardTitle,
-            color = palette.textPrimary
-        )
-        content()
+/** 确认页「执行动作」卡的行：动作 + 分类 + 该动作的每个参数（取值翻成中文标签）。 */
+private fun actionReviewRows(
+    category: String,
+    actionType: String,
+    params: Map<String, JsonPrimitive>,
+    command: String
+): List<UfiWizardReviewRow> {
+    val def = ActionRegistry.getByType(actionType)
+    return buildList {
+        add(UfiWizardReviewRow("动作", def?.name ?: actionType.ifBlank { "未选择" }))
+        add(UfiWizardReviewRow(
+            "分类",
+            ActionRegistry.categories.firstOrNull { it.first == category }?.second ?: category
+        ))
+        def?.params?.forEach { param ->
+            val raw = if (param.key == "command") command else params[param.key]?.content ?: param.default.content
+            // options 是别的模块的 public 属性，智能转换不成立，先落成局部 val
+            val options = param.options
+            val shown = when {
+                param.type == ParamType.BOOLEAN -> if (raw.toBoolean()) "开启" else "关闭"
+                options != null -> options.firstOrNull { it.first == raw }?.second ?: raw
+                raw.isBlank() -> "未填写"
+                else -> raw
+            }
+            add(UfiWizardReviewRow(param.label, shown))
+        }
+    }
+}
+
+/** 确认页「触发条件」卡的行：条件名 + 该条件的阈值参数。 */
+private fun triggerReviewRows(
+    triggerType: String,
+    triggerName: String,
+    trafficGb: String,
+    rsrp: String,
+    batteryLevel: String,
+    targetType: String
+): List<UfiWizardReviewRow> = buildList {
+    add(UfiWizardReviewRow("条件", triggerName))
+    when (triggerType) {
+        "traffic_total_reached" -> add(UfiWizardReviewRow("流量阈值", "$trafficGb GB"))
+        "signal_below" -> add(UfiWizardReviewRow("RSRP 阈值", "$rsrp dBm"))
+        "battery_below" -> add(UfiWizardReviewRow("电量阈值", "$batteryLevel %"))
+        "network_type_changed" -> add(UfiWizardReviewRow("目标网络类型", targetType))
+        "disconnect" -> add(UfiWizardReviewRow("参数", "无"))
     }
 }
 
@@ -1134,4 +1481,28 @@ private fun EnableToggleRow(
         UfiSwitch(checked = checked, onCheckedChange = onCheckedChange)
     }
 }
+
+// ──────────── 校验口径与常量 ────────────
+
+/**
+ * RSRP 阈值的可填下界（dBm）。
+ *
+ * -140 是 3GPP 为 LTE/NR 定义的 RSRP 量程下限（RSRP_00），再低的数字没有物理含义。
+ */
+private const val RSRP_MIN_DBM = -140
+
+/**
+ * RSRP 阈值的可填上界（dBm）。
+ *
+ * -40 是量程上限（贴着基站也到不了 0）。卡住上界是为了拦下"填了正数"这类笔误 ——
+ * `rsrp <= threshold` 在正数阈值下会**永真**，规则每轮都触发。
+ */
+private const val RSRP_MAX_DBM = -40
+
+/** 「网络跳变」的目标类型候选。与 core 侧 ConditionEngine 比较的网络类型字符串一致。 */
+private val NETWORK_TARGET_TYPES = listOf("4G", "5G", "3G", "2G", "WiFi")
+
+/** 动作参数切换时的纵向位移量 = 容器高度 / 8（沿用改造前的取值，观感不变）。 */
+private const val PARAM_SLIDE_DIVISOR = 8
+
 

@@ -14,9 +14,11 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import kotlinx.coroutines.launch
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -29,6 +31,7 @@ import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import com.ufi_axis.ui.components.common.DialogButtonRow
 import com.ufi_axis.ui.components.common.UfiCustomDialog
+import com.ufi_axis.ui.components.common.UfiDialogBody
 import com.ufi_axis.ui.components.common.UfiOptionGrid
 import com.ufi_axis.ui.components.common.UfiOptionItem
 import com.ufi_axis.ui.components.common.UfiPageBackground
@@ -45,6 +48,8 @@ import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.ufiCardShadow
 import androidx.navigation.NavHostController
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.viewmodel.state.deviceUnsupportedNote
+import com.ufi_axis_core.contract.Capability
 
 /**
  * 设备控制页（v4 2026-08-23：开关型入口右侧 Switch，去弹窗）
@@ -66,6 +71,15 @@ fun DeviceControlScreen(
 ) {
     val deviceSettingsState by viewModel.deviceSettingsState.collectAsState()
 
+    // 设备能力集（批 O / 3.5）：本页 4 项里只有「性能模式」进了 Capability 枚举
+    // （core 的 `/api/device/performance` 有 route 门禁）。指示灯 / WiFi 休眠 / 定时重启
+    // 不在 10 个域里，按口径**照旧不拦**，这一批一个字都不改。
+    //
+    // ⚠ 能力集未拉到 / 拉失败时 supports() 恒为 true —— 保持现状，全部可点。
+    val capabilities by viewModel.network.capabilityState.collectAsState()
+    val perfSupported = capabilities.supports(Capability.PERFORMANCE_MODE)
+
+
     // Device settings state
     var ledOn by remember { mutableStateOf(true) }
     var perfOn by remember { mutableStateOf(false) }
@@ -74,9 +88,26 @@ fun DeviceControlScreen(
     var restartScheduleOn by remember { mutableStateOf(false) }
     var restartTime by remember { mutableStateOf("00:00") }
 
+    // 2026-10-10 暂时隐藏：真 PTY 终端（ttyd）的状态镜像与首帧 status 拉取。
+    // 这段必须跟着下面那个开关卡片一起藏 —— 否则留着就是四个无人读写的死状态，
+    // 而这个 LaunchedEffect 还在每次进页白发一次 ttydStatus() 请求。
+    // var ttydEnabled by remember { mutableStateOf(false) }
+    // var ttydRunning by remember { mutableStateOf(false) }
+    // var ttydBusy by remember { mutableStateOf(false) }
+    // var ttydNote by remember { mutableStateOf<String?>(null) }
+    // LaunchedEffect(Unit) {
+    //     viewModel.tools.ttydStatus()?.let { (en, run) ->
+    //         ttydEnabled = en
+    //         ttydRunning = run
+    //     } ?: run { ttydNote = "状态未知（core 未连接）" }
+    // }
+    val scope = rememberCoroutineScope()
+
     LaunchedEffect(Unit) {
         kotlinx.coroutines.delay(300)
         viewModel.network.loadDeviceSettings()
+        // 能力集自带"本进程只成功拉一次"的闸门，无条件调不会每次进页面都发请求。
+        viewModel.network.loadDeviceCapabilities()
     }
 
     LaunchedEffect(deviceSettingsState.settings) {
@@ -125,16 +156,68 @@ fun DeviceControlScreen(
                     UfiSettingsToggle(
                         icon = AppIconPerformance,
                         title = "性能模式",
-                        description = if (perfOn) "高性能 · CPU 最大频率" else "均衡 · 自动调节",
+                        // 置灰时把原说明保留、原因另起一行追加。checked 仍是设备真值 ——
+                        // 「不支持」不等于「关着」，把它显示成关就是假开关。
+                        description = if (perfSupported) {
+                            if (perfOn) "高性能 · CPU 最大频率" else "均衡 · 自动调节"
+                        } else {
+                            (if (perfOn) "高性能 · CPU 最大频率" else "均衡 · 自动调节") +
+                                "\n" + deviceUnsupportedNote("性能模式")
+                        },
                         checked = perfOn,
                         onCheckedChange = {
                             perfOn = it
                             viewModel.network.setPerformanceMode(if (it) "performance" else "balanced")
-                        }
+                        },
+                        enabled = perfSupported
                     )
                 }
 
-                // ═══ 入口 3：WiFi 休眠（保留 chevron + Dialog：7 个时间选项）═══
+                // ═══ 入口 3：真 PTY 终端（ttyd，2026-10-07）—— 2026-10-10 暂时隐藏 ═══
+                // 整套真 PTY 功能尚未完工（app 端渲染方式待重做），开关入口先撤下。
+                // 注意：下面注释块里的 ttydEnabled/ttydRunning/ttydBusy/ttydNote 四个状态
+                // 也一并注释了 —— 留着会变成无人读写的死状态（且 onLaunched 的 ttydStatus()
+                // 轮询还在跑，白耗一次请求）。恢复时四处一起放开。
+                // // ═══ 入口 3：真 PTY 终端（ttyd，2026-10-07）═══
+                // // 开=立即拉起设备后台 ttyd（root shell，30 分钟滑动过期）；关=停进程。
+                // // 完整交互终端（xterm）在 web 端终端页；app 端提供开关与状态，排障用。
+                // UfiSettingsRowCard {
+                // UfiSettingsToggle(
+                // icon = AppIconPerformance,
+                // title = "真 PTY 终端（ttyd）",
+                // description = buildString {
+                // append(if (ttydEnabled) "已开启" else "已关闭")
+                // if (ttydEnabled) append(if (ttydRunning) " · 进程运行中" else " · 进程未运行")
+                // ttydNote?.let { append("\n$it") }
+                // },
+                // checked = ttydEnabled,
+                // onCheckedChange = { target ->
+                // if (!ttydBusy) {
+                // ttydBusy = true
+                // ttydEnabled = target
+                // scope.launch {
+                // runCatching { viewModel.tools.setTtydEnabled(target) }
+                // .onSuccess {
+                // ttydNote = if (target) "已开启，进程正在启动" else "已关闭"
+                // if (target) {
+                // kotlinx.coroutines.delay(1500)
+                // viewModel.tools.ttydStatus()?.let { (en, run) ->
+                // ttydEnabled = en; ttydRunning = run
+                // }
+                // }
+                // }
+                // .onFailure { e ->
+                // ttydEnabled = !target
+                // ttydNote = "操作失败：${e.message ?: "未知错误"}"
+                // }
+                // ttydBusy = false
+                // }
+                // }
+                // }
+                // )
+                // }
+
+                // ═══ 入口 4：WiFi 休眠（保留 chevron + Dialog：7 个时间选项）═══
                 UfiSettingsRowCard {
                     UfiSettingsItem(
                         icon = AppIconWifiSleep,
@@ -194,25 +277,26 @@ fun DeviceControlScreen(
                 dismissButton = null,
                 showCloseButton = false
             ) {
-                Text(
-                    "设置无数据传输后多久关闭 WiFi 节省电量。",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = palette.textSecondary
-                )
-                Spacer(Modifier.height(Spacing.Medium))
-                // 2026-08-18：私货回收为公共组件 UfiOptionGrid（视觉升级：橙描边+橙字+12% 浅橙底选中，
-                // 与 TaskScreen「模式」段完全一致；替代原先 30 行自绘 FilterChip 双栏 grid）
-                val wifiSleepOptions = listOf(
-                    "0" to "从不", "5" to "5 分钟", "10" to "10 分钟",
-                    "20" to "20 分钟", "30" to "30 分钟", "60" to "1 小时", "120" to "2 小时"
-                )
-                UfiOptionGrid(
-                    options = wifiSleepOptions.map { (value, label) -> UfiOptionItem(value = value, label = label) },
-                    selectedValue = wifiSleepDraft,
-                    onSelect = { wifiSleepDraft = it },
-                    columns = 2
-                )
-                Spacer(Modifier.height(Spacing.Medium))
+                // 间距统一到 UfiDialogBody（12dp）
+                UfiDialogBody {
+                    Text(
+                        "设置无数据传输后多久关闭 WiFi 节省电量。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = palette.textSecondary
+                    )
+                    // 2026-08-18：私货回收为公共组件 UfiOptionGrid（视觉升级：橙描边+橙字+12% 浅橙底选中，
+                    // 与 TaskScreen「模式」段完全一致；替代原先 30 行自绘 FilterChip 双栏 grid）
+                    val wifiSleepOptions = listOf(
+                        "0" to "从不", "5" to "5 分钟", "10" to "10 分钟",
+                        "20" to "20 分钟", "30" to "30 分钟", "60" to "1 小时", "120" to "2 小时"
+                    )
+                    UfiOptionGrid(
+                        options = wifiSleepOptions.map { (value, label) -> UfiOptionItem(value = value, label = label) },
+                        selectedValue = wifiSleepDraft,
+                        onSelect = { wifiSleepDraft = it },
+                        columns = 2
+                    )
+                }
                 DialogButtonRow(
                     confirmText = "确认",
                     onConfirm = {
@@ -243,41 +327,40 @@ fun DeviceControlScreen(
                 dismissButton = null,
                 showCloseButton = false
             ) {
-                Text(
-                    "开启后设备每日定时自动重启。",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = palette.textSecondary
-                )
-                Spacer(Modifier.height(Spacing.Medium))
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text("启用", style = UfiTextStyles.listItemTitle, color = palette.textPrimary)
-                    // 2026-08-31：M3 Switch + switchColors → 公共 UfiSwitch
-                    UfiSwitch(
-                        checked = restartOnDraft,
-                        onCheckedChange = { restartOnDraft = it }
+                UfiDialogBody {
+                    Text(
+                        "开启后设备每日定时自动重启。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = palette.textSecondary
                     )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("启用", style = UfiTextStyles.listItemTitle, color = palette.textPrimary)
+                        // 2026-08-31：M3 Switch + switchColors → 公共 UfiSwitch
+                        UfiSwitch(
+                            checked = restartOnDraft,
+                            onCheckedChange = { restartOnDraft = it }
+                        )
+                    }
+                    if (restartOnDraft) {
+                        UfiTextField(
+                            value = restartTimeDraft,
+                            onValueChange = {
+                                restartTimeDraft = it
+                                timeError = if (it.isNotEmpty() && !timeRegex.matches(it))
+                                    "格式: HH:MM（00:00–23:59）" else null
+                            },
+                            label = "重启时间",
+                            placeholder = "00:00",
+                            isError = timeError != null,
+                            errorMessage = timeError
+                        )
+                        // v3（2026-08-11）：删除冗余"保存时间"按钮——点击底部"完成"统一触发保存+关闭
+                    }
                 }
-                if (restartOnDraft) {
-                    Spacer(Modifier.height(Spacing.Small))
-                    UfiTextField(
-                        value = restartTimeDraft,
-                        onValueChange = {
-                            restartTimeDraft = it
-                            timeError = if (it.isNotEmpty() && !timeRegex.matches(it))
-                                "格式: HH:MM（00:00–23:59）" else null
-                        },
-                        label = "重启时间",
-                        placeholder = "00:00",
-                        isError = timeError != null,
-                        errorMessage = timeError
-                    )
-                    // v3（2026-08-11）：删除冗余"保存时间"按钮——点击底部"完成"统一触发保存+关闭
-                }
-                Spacer(Modifier.height(Spacing.Medium))
                 DialogButtonRow(
                     confirmText = "确认",
                     onConfirm = {

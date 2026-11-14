@@ -260,6 +260,14 @@ fun NotifyManageScreen(
                         toastMessage = when (val result = NotificationCenter(context).sendTestNotification()) {
                             is NotificationCenter.TestResult.Success ->
                                 ToastMessage("已发送测试通知 · 下拉状态栏查看", ToastType.SUCCESS, durationMs = 4000L)
+                            // 转交给 :ufi_notify 后本进程拿不到真实发射结果（免打扰 / channel 被关 /
+                            // ROM 限频都会被静默拦下），所以文案只说「已转交」，不替系统打包票。
+                            is NotificationCenter.TestResult.Dispatched ->
+                                ToastMessage(
+                                    "已交给通知进程 · 下拉状态栏确认；若没看到请检查系统「应用通知」与免打扰",
+                                    ToastType.INFO,
+                                    durationMs = 5000L
+                                )
                             is NotificationCenter.TestResult.PermissionDenied ->
                                 ToastMessage(
                                     "通知权限未授予，请在系统「应用通知」中开启 UFI-AXIS",
@@ -381,9 +389,15 @@ private fun RetentionDialog(
         visible = true,
         onDismiss = onDismiss,
         title = "记录保留上限",
-        confirmButton = { UfiButton(text = "确认", onClick = { onConfirm(rows, ageDays) }) },
+        confirmButton = {
+            // 关闭动作交给 shell 排时序：离场 backdrop（逐渐清晰）要播完才卸载窗口，
+            // 见 LocalUfiDialogClose；必须在 slot 内部读才能拿到 shell 注入的实现。
+            val close = LocalUfiDialogClose.current
+            UfiButton(text = "确认", onClick = { close { onConfirm(rows, ageDays) } })
+        },
         dismissButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = onDismiss)
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close(onDismiss) })
         }
     ) {
         UfiDialogBody {
@@ -467,9 +481,13 @@ private fun DndWindowDialog(
         title = "免打扰时段",
         // 确认位保持 size = Standard 而不是 Small：后者高度是 SmallButtonHeight，
         // 与 dismiss 位（Secondary + Standard = ButtonHeight）不等高，看起来像"取消高/确认矮"。
-        confirmButton = { UfiButton(text = "确认", onClick = { onConfirm(silentStart, silentEnd) }) },
+        confirmButton = {
+            val close = LocalUfiDialogClose.current
+            UfiButton(text = "确认", onClick = { close { onConfirm(silentStart, silentEnd) } })
+        },
         dismissButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = onDismiss)
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close(onDismiss) })
         }
     ) {
         UfiDialogBody {

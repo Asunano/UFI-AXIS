@@ -52,7 +52,9 @@ import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavHostController
 import com.ufi_axis.ui.components.common.UfiCustomDialog
+import com.ufi_axis.ui.components.common.LocalUfiDialogClose
 import com.ufi_axis.ui.components.common.UfiButton
+import com.ufi_axis.ui.components.common.UfiDialogBody
 import com.ufi_axis.ui.components.common.UfiButtonVariant
 import com.ufi_axis.ui.components.common.UfiScreenScaffold
 import com.ufi_axis.ui.components.common.UfiSettingsGroup
@@ -468,6 +470,57 @@ fun SpeedTestScreen(viewModel: MainViewModel, navController: NavHostController) 
                 }
             }
 
+            // ═══════════ ⑥ 定时测速历史（2026-10-06 批C 对齐：core/web 已有，app 补消费） ═══════════
+            // 有记录才显示；测速完成时由 NetworkModule 在 DONE 分支刷新。
+            val history by viewModel.speedTestHistory.collectAsState()
+            LaunchedEffect(Unit) { viewModel.network.refreshSpeedTestHistory() }
+            LaunchedEffect(state.phase) {
+                if (state.phase == SpeedTestPhase.DONE) viewModel.network.refreshSpeedTestHistory()
+            }
+            if (history.isNotEmpty()) {
+                UfiSettingsGroup {
+                    Text(
+                        text = "定时测速历史",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = palette.textSecondary,
+                        modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin, vertical = 4.dp)
+                    )
+                    history.take(10).forEach { h ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = Spacing.CardHorizontalMargin, vertical = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    text = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.CHINA)
+                                        .format(java.util.Date(h.timestamp)),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = palette.textSecondary
+                                )
+                                Text(
+                                    text = "↓ ${"%.1f".format(h.downloadMbps)} · ↑ ${"%.1f".format(h.uploadMbps)} Mbps · ${h.latencyMs} ms",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                            Text(
+                                text = if (h.trigger == "scheduled") "定时" else "手动",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = palette.textSecondary,
+                                modifier = Modifier
+                                    .background(
+                                        palette.divider.copy(alpha = 0.35f),
+                                        androidx.compose.foundation.shape.RoundedCornerShape(8.dp)
+                                    )
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
             Spacer(Modifier.height(Spacing.Large))
         }
 
@@ -479,16 +532,24 @@ fun SpeedTestScreen(viewModel: MainViewModel, navController: NavHostController) 
             onDismiss = { showTargetPicker = false },
             title = "测速目标"
         ) {
-            TargetSelector(
-                options = targets,
-                selectedIndex = selectedTarget,
-                onSelect = { index ->
-                    val t = targets[index]
-                    mode = t.mode
-                    if (t.nodeId != null) nodeId = t.nodeId
-                    showTargetPicker = false
-                }
-            )
+            // 间距统一到 UfiDialogBody（12dp）：标题↔列表的呼吸由外壳给，这里不再手写 Spacer。
+            UfiDialogBody {
+                // 2026-09-18：点行即生效并关闭，所以这个"关闭动作"要经 LocalUfiDialogClose 排时序 ——
+                // 直接翻 showTargetPicker 会让弹窗当帧卸载，离场的背景渐清没机会播。local 在 content 内读。
+                val close = LocalUfiDialogClose.current
+                TargetSelector(
+                    options = targets,
+                    selectedIndex = selectedTarget,
+                    onSelect = { index ->
+                        close {
+                            val t = targets[index]
+                            mode = t.mode
+                            if (t.nodeId != null) nodeId = t.nodeId
+                            showTargetPicker = false
+                        }
+                    }
+                )
+            }
         }
     }
 }

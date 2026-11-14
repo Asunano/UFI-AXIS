@@ -33,8 +33,8 @@ import com.ufi_axis.viewmodel.MainViewModel
  * - 免打扰时段开关（时段本身在「通知管理」里改，本页只有开关）
  *
  * 本页的入口在「通知与守护」，**总开关关着时那个入口是置灰的**（守护的唯一产物就是通知）。
- * 与之配套：`GuardScheduler.syncSchedule` 的排期条件是「后台轮询开关 AND 全局通知总闸」，
- * 所以总闸一关周期任务就被取消，不会留下"看不见、关不掉、还在耗电"的空转任务。
+ * 与之配套：`GuardScheduler.syncSchedule` 在「前台服务保活」开启时**取消**主进程 Worker
+ * （轮询归 :ufi_notify）；保活关闭时才按「后台轮询 AND 总闸」enqueue WorkManager 兜底。
  *
  * 跨进程：本页所有开关在写本地偏好（ufi_axis_prefs，两进程共享文件）的同时，经
  * NotificationConfigClient（AIDL）异步同步到 :ufi_notify 通知进程（绑定失败静默跳过）。
@@ -195,10 +195,11 @@ fun BackgroundGuardScreen(
                         keepAliveEnabled && !notifAllowed ->
                             "系统已禁止本应用通知，保活无法生效，点击前往系统设置开启"
                         keepAliveEnabled ->
-                            "已开启：通知进程前台常驻（状态栏有一条「通知守护」常驻通知），告警实时到达"
+                            "已开启：仅 :ufi_notify 前台常驻（状态栏「通知守护」），" +
+                                "不再用 WorkManager 周期唤醒主进程，告警实时到达"
                         guardState.enabled ->
-                            "已关闭：无常驻通知、更省电；代价是后台告警改为按「后台轮询」的 " +
-                                "${guardState.intervalMinutes} 分钟周期获取，不再实时"
+                            "已关闭：无常驻通知；后台靠「后台轮询」的 " +
+                                "${guardState.intervalMinutes} 分钟 WorkManager 兜底（会唤醒主进程，不如保活省电）"
                         else ->
                             "已关闭：「后台轮询」同样未开启，App 退到后台后不会收到告警通知"
                     },

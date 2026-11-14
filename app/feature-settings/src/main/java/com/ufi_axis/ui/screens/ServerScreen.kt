@@ -3,41 +3,48 @@ package com.ufi_axis.ui.screens
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Devices
+import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.Router
 import androidx.compose.material.icons.filled.Smartphone
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.runtime.Composable
+import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
+import com.ufi_axis.ui.components.common.UfiConfirmDialog
 import com.ufi_axis.ui.components.common.UfiPageBackground
 import com.ufi_axis.ui.components.common.UfiScreenScaffold
 import com.ufi_axis.ui.components.common.UfiSettingsChevron
 import com.ufi_axis.ui.components.common.UfiSettingsItem
 import com.ufi_axis.ui.components.common.UfiSettingsRowCard
 import com.ufi_axis.ui.navigation.Routes
+import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
+import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.viewmodel.MainViewModel
 
 /**
- * 「服务器」二级入口主页（v2 2026-08-23：去掉顶部 Tab，改成 3 张入口卡）。
+ * 「服务器」二级入口主页。
  *
- * 历史：原 v1 在页面顶部 UfiScrollableTabRow「服务器配置 / 设备控制 / 配对与访问」三 Tab，
- * 各 Tab 内嵌调用对应 Screen（showHeader=false）。现按用户偏好去掉 Tab，
- * 把 3 个二级页平铺成 3 张入口卡（图标 + 标题 + 副标题 + chevron），
- * 点击后 navigate 到 DETAIL_SERVER_CONFIG / DETAIL_DEVICE_CONTROL / DETAIL_PAIRING
- * 三个独立二级页（路由已在 NavScreens.kt 定义，AppScreens.kt 已挂载）。
- *
- * 容器与行布局全部走公共组件 [UfiSettingsRowCard] + [UfiSettingsItem]
- * （2026-08-30：原来这里手搓 rowModifier 四链 + Row/Icon/Column/Text，各页各写一份）。
+ * 2026-09 增加「切换设备 / 退出」：
+ * - token 与本机 Keystore 绑定，换另一台 Core **不能**只改 IP，必须清凭据重新配对；
+ * - 本入口显式调用 [onRepairRequested]（MainActivity：清 token + reset 密钥 + 回 SetupScreen）。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ServerScreen(
-    viewModel: MainViewModel,
-    onServerConfigChanged: () -> Unit,
-    navController: NavHostController
+    @Suppress("UNUSED_PARAMETER") viewModel: MainViewModel,
+    @Suppress("UNUSED_PARAMETER") onServerConfigChanged: () -> Unit,
+    navController: NavHostController,
+    onRepairRequested: () -> Unit = {}
 ) {
+    val context = LocalContext.current
+    val prefs = remember { AppPreferences(context) }
+    val palette = LocalResolvedPalette.current
+    var showSwitchConfirm by remember { mutableStateOf(false) }
+    var displayEndpoint by remember { mutableStateOf("${prefs.serverIp}:${prefs.serverPort}") }
+
     UfiScreenScaffold(title = "服务器", navController = navController, showBack = true) { padding ->
         UfiPageBackground(modifier = Modifier.padding(padding)) {
             Column(
@@ -77,8 +84,40 @@ fun ServerScreen(
                     )
                 }
 
+                // 入口 4：切换设备 / 退出（危险操作，二次确认）
+                UfiSettingsRowCard {
+                    UfiSettingsItem(
+                        icon = Icons.Default.Logout,
+                        iconTint = palette.error,
+                        title = "切换设备 / 退出",
+                        description = "当前 $displayEndpoint · 清除本机凭据后重新配对",
+                        onClick = { showSwitchConfirm = true },
+                        trailing = { UfiSettingsChevron() }
+                    )
+                }
+
                 Spacer(Modifier.height(Spacing.Large))
             }
+        }
+
+        if (showSwitchConfirm) {
+            UfiConfirmDialog(
+                visible = true,
+                title = "切换设备 / 退出",
+                text = "将清除本机保存的连接凭据与设备身份密钥，并回到配对引导页。\n\n" +
+                    "· 换到另一台 Core：需重新输入配对密码\n" +
+                    "· 仍连当前设备：重新配对即可，服务端配对记录不会自动删除\n" +
+                    "· 本机缓存的仪表盘数据会一并清空",
+                confirmText = "退出并重新配对",
+                dismissText = "取消",
+                destructive = true,
+                onDismiss = { showSwitchConfirm = false },
+                onConfirm = {
+                    showSwitchConfirm = false
+                    displayEndpoint = ""
+                    onRepairRequested()
+                }
+            )
         }
     }
 }

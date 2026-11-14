@@ -247,24 +247,25 @@ fun AppearanceSettingsScreen(
                 dismissButton = null,
                 showCloseButton = false
             ) {
-                Text(
-                    "选择界面整体明暗风格。自动模式会跟随系统设置切换。",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = palette.textSecondary
-                )
-                Spacer(Modifier.height(Spacing.Medium))
-                UfiSingleChipSelector(
-                    options = listOf("auto" to "自动", "light" to "浅色", "dark" to "深色"),
-                    selectedValue = draftMode.name.lowercase(),
-                    onSelect = { v ->
-                        draftMode = when (v) {
-                            "light" -> ThemeMode.LIGHT
-                            "dark" -> ThemeMode.DARK
-                            else -> ThemeMode.AUTO
+                // 间距统一到 UfiDialogBody（12dp）
+                UfiDialogBody {
+                    Text(
+                        "选择界面整体明暗风格。自动模式会跟随系统设置切换。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = palette.textSecondary
+                    )
+                    UfiSingleChipSelector(
+                        options = listOf("auto" to "自动", "light" to "浅色", "dark" to "深色"),
+                        selectedValue = draftMode.name.lowercase(),
+                        onSelect = { v ->
+                            draftMode = when (v) {
+                                "light" -> ThemeMode.LIGHT
+                                "dark" -> ThemeMode.DARK
+                                else -> ThemeMode.AUTO
+                            }
                         }
-                    }
-                )
-                Spacer(Modifier.height(Spacing.Medium))
+                    )
+                }
                 DialogButtonRow(
                     confirmText = "确认",
                     onConfirm = {
@@ -292,60 +293,60 @@ fun AppearanceSettingsScreen(
                 showCloseButton = false
             ) {
                 Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
-                    Text(
-                        "选择配色方案。每套皮肤自带浅色 / 深色两组取值，随上面的「外观模式」切换。" +
-                            "最后一格是「自定义」——点它进取色器自己挑主色。",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = palette.textSecondary
-                    )
-                    Spacer(Modifier.height(Spacing.Medium))
-                    // 直接遍历 ThemePresets.allPresets：加皮肤只改预设表，这里零改动。
-                    // 复用既有的 UfiOptionGrid（弹窗内双栏选项网格），不新造选择器组件。
-                    //
-                    // 「自定义」是**追加**的一格而不是表里的一项：它没有固定色值
-                    //（见 ThemePresets.allPresets 的 KDoc）。它的 onSelect 也与别的格不同 ——
-                    // 别的格只改草稿，它直接换到取色器（不先落草稿：没选过种子色时
-                    //「草稿 = custom」是一个确认了也没颜色的半套状态）。
-                    UfiOptionGrid(
-                        options = ThemePresets.allPresets.map { preset ->
-                            UfiOptionItem(
-                                value = preset.id,
-                                label = preset.name,
+                    UfiDialogBody {
+                        Text(
+                            "选择配色方案。每套皮肤自带浅色 / 深色两组取值，随上面的「外观模式」切换。" +
+                                "最后一格是「自定义」——点它进取色器自己挑主色。",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = palette.textSecondary
+                        )
+                        // 直接遍历 ThemePresets.allPresets：加皮肤只改预设表，这里零改动。
+                        // 复用既有的 UfiOptionGrid（弹窗内双栏选项网格），不新造选择器组件。
+                        //
+                        // 「自定义」是**追加**的一格而不是表里的一项：它没有固定色值
+                        //（见 ThemePresets.allPresets 的 KDoc）。它的 onSelect 也与别的格不同 ——
+                        // 别的格只改草稿，它直接换到取色器（不先落草稿：没选过种子色时
+                        //「草稿 = custom」是一个确认了也没颜色的半套状态）。
+                        UfiOptionGrid(
+                            options = ThemePresets.allPresets.map { preset ->
+                                UfiOptionItem(
+                                    value = preset.id,
+                                    label = preset.name,
+                                    leading = {
+                                        ThemeSwatch(
+                                            color = preset.resolve(palette.isDark).accent,
+                                            borderColor = palette.cardBorder
+                                        )
+                                    }
+                                )
+                            } + UfiOptionItem(
+                                value = CUSTOM_THEME_ID,
+                                label = if (hasCustomSeed) CUSTOM_THEME_NAME else "$CUSTOM_THEME_NAME…",
                                 leading = {
                                     ThemeSwatch(
-                                        color = preset.resolve(palette.isDark).accent,
+                                        // 色点显示的是"这个种子色**实际**会变成的 accent"（夹取后的值），
+                                        // 不是种子色本身 —— 与取色器里的预览同一口径。
+                                        color = if (hasCustomSeed) {
+                                            buildCustomPalette(Color(customSeedColor))
+                                                .resolve(palette.isDark).accent
+                                        } else {
+                                            palette.textSecondary
+                                        },
                                         borderColor = palette.cardBorder
                                     )
                                 }
-                            )
-                        } + UfiOptionItem(
-                            value = CUSTOM_THEME_ID,
-                            label = if (hasCustomSeed) CUSTOM_THEME_NAME else "$CUSTOM_THEME_NAME…",
-                            leading = {
-                                ThemeSwatch(
-                                    // 色点显示的是"这个种子色**实际**会变成的 accent"（夹取后的值），
-                                    // 不是种子色本身 —— 与取色器里的预览同一口径。
-                                    color = if (hasCustomSeed) {
-                                        buildCustomPalette(Color(customSeedColor))
-                                            .resolve(palette.isDark).accent
-                                    } else {
-                                        palette.textSecondary
-                                    },
-                                    borderColor = palette.cardBorder
-                                )
-                            }
-                        ),
-                        selectedValue = draftThemeId,
-                        onSelect = { id ->
-                            if (id == CUSTOM_THEME_ID) {
-                                openDialog = AppearanceDialog.CUSTOM_COLOR
-                            } else {
-                                draftThemeId = id
-                            }
-                        },
-                        columns = 2
-                    )
-                    Spacer(Modifier.height(Spacing.Medium))
+                            ),
+                            selectedValue = draftThemeId,
+                            onSelect = { id ->
+                                if (id == CUSTOM_THEME_ID) {
+                                    openDialog = AppearanceDialog.CUSTOM_COLOR
+                                } else {
+                                    draftThemeId = id
+                                }
+                            },
+                            columns = 2
+                        )
+                    }
                     DialogButtonRow(
                         confirmText = "确认",
                         onConfirm = {
@@ -399,74 +400,74 @@ fun AppearanceSettingsScreen(
                 showCloseButton = false
             ) {
                 Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
-                    Text(
-                        "挑一个主色，整套配色（页面底 / 卡面 / 正文 / 强调）由它推导。" +
-                            "正文与卡面的明度是固定的，所以无论挑什么颜色都读得清。",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = palette.textSecondary
-                    )
-                    Spacer(Modifier.height(Spacing.Medium))
-
-                    CustomColorPreview(
-                        preview = preview,
-                        isDark = palette.isDark,
-                        seed = seed,
-                        borderColor = palette.cardBorder
-                    )
-
-                    Spacer(Modifier.height(Spacing.Medium))
-                    UfiSlider(
-                        value = draftHue,
-                        onValueChange = { draftHue = it },
-                        valueRange = 0f..HUE_MAX,
-                        label = "色相",
-                        valueLabel = "${draftHue.roundToInt()}°"
-                    )
-                    UfiSlider(
-                        value = draftSat,
-                        onValueChange = { draftSat = it },
-                        valueRange = 0f..1f,
-                        label = "饱和度",
-                        valueLabel = "${(draftSat * PERCENT).roundToInt()}%"
-                    )
-                    UfiSlider(
-                        value = draftLight,
-                        onValueChange = { draftLight = it },
-                        valueRange = 0f..1f,
-                        label = "明度",
-                        valueLabel = "${(draftLight * PERCENT).roundToInt()}%"
-                    )
-
-                    // 夹取提示：明度越界时 accent 会被收进可用区间，预览里已经显示的是
-                    // 夹取后的真实颜色，但**必须配一句解释** —— 否则用户看到的是
-                    // "滑块还在动、色块不再变"，那就是一个坏了的滑块。
-                    if (clamped) {
+                    UfiDialogBody {
                         Text(
-                            "明度已收进可用区间（浅色态 " +
-                                "${(CUSTOM_ACCENT_LIGHT_L_MIN * PERCENT).roundToInt()}~" +
-                                "${(CUSTOM_ACCENT_LIGHT_L_MAX * PERCENT).roundToInt()}%、深色态 " +
-                                "${(CUSTOM_ACCENT_DARK_L_MIN * PERCENT).roundToInt()}~" +
-                                "${(CUSTOM_ACCENT_DARK_L_MAX * PERCENT).roundToInt()}%）：" +
-                                "太亮或太暗的强调色会和卡面 / 页面底糊在一起。上面预览的是实际效果。",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = palette.textSecondary,
-                            modifier = Modifier.padding(horizontal = Spacing.XLarge)
+                            "挑一个主色，整套配色（页面底 / 卡面 / 正文 / 强调）由它推导。" +
+                                "正文与卡面的明度是固定的，所以无论挑什么颜色都读得清。",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = palette.textSecondary
                         )
-                    }
-                    // 硬指标闸门：算不出合格解时**禁止确认并说明原因**，不静默给一套不合格配色。
-                    // 按当前推导公式这一支不可达（`CustomPaletteTest` 对全域种子扫过），
-                    // 留着是因为"我证明过所以不检查"在有人改了推导常数之后就不成立了。
-                    if (violations.isNotEmpty()) {
-                        Text(
-                            "这个颜色推出的配色达不到对比度要求，无法确认：" +
-                                violations.joinToString("；") + "。请换一个颜色。",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = palette.error,
-                            modifier = Modifier.padding(horizontal = Spacing.XLarge)
+                        CustomColorPreview(
+                            preview = preview,
+                            isDark = palette.isDark,
+                            seed = seed,
+                            borderColor = palette.cardBorder
                         )
+                        // H / S / L 三条滑块是**同一个控件组**（三个分量一起决定一个颜色），
+                        // 所以整组作为 body 的单个子级：组与组之间 12dp、组内 4dp。
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(Spacing.Small)
+                        ) {
+                            UfiSlider(
+                                value = draftHue,
+                                onValueChange = { draftHue = it },
+                                valueRange = 0f..HUE_MAX,
+                                label = "色相",
+                                valueLabel = "${draftHue.roundToInt()}°"
+                            )
+                            UfiSlider(
+                                value = draftSat,
+                                onValueChange = { draftSat = it },
+                                valueRange = 0f..1f,
+                                label = "饱和度",
+                                valueLabel = "${(draftSat * PERCENT).roundToInt()}%"
+                            )
+                            UfiSlider(
+                                value = draftLight,
+                                onValueChange = { draftLight = it },
+                                valueRange = 0f..1f,
+                                label = "明度",
+                                valueLabel = "${(draftLight * PERCENT).roundToInt()}%"
+                            )
+                        }
+                        // 夹取提示：明度越界时 accent 会被收进可用区间，预览里已经显示的是
+                        // 夹取后的真实颜色，但**必须配一句解释** —— 否则用户看到的是
+                        // "滑块还在动、色块不再变"，那就是一个坏了的滑块。
+                        if (clamped) {
+                            Text(
+                                "明度已收进可用区间（浅色态 " +
+                                    "${(CUSTOM_ACCENT_LIGHT_L_MIN * PERCENT).roundToInt()}~" +
+                                    "${(CUSTOM_ACCENT_LIGHT_L_MAX * PERCENT).roundToInt()}%、深色态 " +
+                                    "${(CUSTOM_ACCENT_DARK_L_MIN * PERCENT).roundToInt()}~" +
+                                    "${(CUSTOM_ACCENT_DARK_L_MAX * PERCENT).roundToInt()}%）：" +
+                                    "太亮或太暗的强调色会和卡面 / 页面底糊在一起。上面预览的是实际效果。",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = palette.textSecondary
+                            )
+                        }
+                        // 硬指标闸门：算不出合格解时**禁止确认并说明原因**，不静默给一套不合格配色。
+                        // 按当前推导公式这一支不可达（`CustomPaletteTest` 对全域种子扫过），
+                        // 留着是因为"我证明过所以不检查"在有人改了推导常数之后就不成立了。
+                        if (violations.isNotEmpty()) {
+                            Text(
+                                "这个颜色推出的配色达不到对比度要求，无法确认：" +
+                                    violations.joinToString("；") + "。请换一个颜色。",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = palette.error
+                            )
+                        }
                     }
-
-                    Spacer(Modifier.height(Spacing.Medium))
                     DialogButtonRow(
                         confirmText = "确认",
                         enabled = violations.isEmpty(),
@@ -515,89 +516,88 @@ fun AppearanceSettingsScreen(
                 showCloseButton = false
             ) {
                 Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
-                    Text(
-                        "主页底部 Tab 切换时的过渡效果。",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = palette.textSecondary
-                    )
-                    Spacer(Modifier.height(Spacing.Medium))
-
-                    // 切换动画类型选择器：双栏网格，减小弹窗体积。
-                    // 数据源直接来自 UfiPageTransitions 注册表（内置 6 种 + 任意运行时注册）。
-                    val transitions = UfiPageTransitions.all()
-                    UfiOptionGrid(
-                        options = transitions.map { t ->
-                            UfiOptionItem(
-                                value = t.id,
-                                label = t.displayName
-                            )
-                        },
-                        selectedValue = draftTransitionId,
-                        onSelect = { draftTransitionId = it },
-                        columns = 2
-                    )
-
-                    Spacer(Modifier.height(Spacing.Medium))
-                    // P2f（2026-09-04）：转场时长新增「关闭」档。
-                    // 为什么是独立开关而不是把滑块下限拉到 0：0 与 150 之间**刻意没有中间档**
-                    // （150ms 以下的整屏转场接近瞬变，只会被感知成闪帧，比干脆关掉更差），
-                    // 塞进滑块会得到一个不等距的档位表，滑到那一段还会显示成"0ms 的动画"。
-                    // 关闭时隐藏滑块，避免出现"开关已关、下面还让你调时长"的自相矛盾。
-                    Row(
-                        Modifier.fillMaxWidth().padding(horizontal = Spacing.XLarge),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
+                    UfiDialogBody {
                         Text(
-                            "关闭转场动画",
-                            style = UfiTextStyles.listItemTitle,
-                            color = palette.textPrimary
-                        )
-                        UfiSwitch(
-                            checked = draftTransitionOff,
-                            onCheckedChange = { draftTransitionOff = it }
-                        )
-                    }
-
-                    if (!draftTransitionOff) {
-                        Spacer(Modifier.height(Spacing.Medium))
-                        Text(
-                            "动画时长",
-                            style = MaterialTheme.typography.labelMedium,
+                            "主页底部 Tab 切换时的过渡效果。",
+                            style = MaterialTheme.typography.bodyMedium,
                             color = palette.textSecondary
                         )
-                        UfiSlider(
-                            value = draftDuration.toFloat(),
-                            onValueChange = { draftDuration = it.roundToInt() },
-                            // 区间与档数由 ThemeManager 的 MIN/MAX 推导，不再写死 150f..600f：
-                            // 150,200,…,600 共 9 档（steps = 档数 - 1 = 8）。
-                            valueRange = ThemeManager.TRANSITION_DURATION_MIN_MS.toFloat()..
-                                ThemeManager.TRANSITION_DURATION_MAX_MS.toFloat(),
-                            steps = (ThemeManager.TRANSITION_DURATION_MAX_MS -
-                                ThemeManager.TRANSITION_DURATION_MIN_MS) / 50 - 1,
-                            label = "",
-                            valueLabel = "${draftDuration}ms",
+                        // 切换动画类型选择器：双栏网格，减小弹窗体积。
+                        // 数据源直接来自 UfiPageTransitions 注册表（内置 6 种 + 任意运行时注册）。
+                        val transitions = UfiPageTransitions.all()
+                        UfiOptionGrid(
+                            options = transitions.map { t ->
+                                UfiOptionItem(
+                                    value = t.id,
+                                    label = t.displayName
+                                )
+                            },
+                            selectedValue = draftTransitionId,
+                            onSelect = { draftTransitionId = it },
+                            columns = 2
                         )
+                        // P2f（2026-09-04）：转场时长新增「关闭」档。
+                        // 为什么是独立开关而不是把滑块下限拉到 0：0 与 150 之间**刻意没有中间档**
+                        // （150ms 以下的整屏转场接近瞬变，只会被感知成闪帧，比干脆关掉更差），
+                        // 塞进滑块会得到一个不等距的档位表，滑到那一段还会显示成"0ms 的动画"。
+                        // 关闭时隐藏滑块，避免出现"开关已关、下面还让你调时长"的自相矛盾。
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                "关闭转场动画",
+                                style = UfiTextStyles.listItemTitle,
+                                color = palette.textPrimary
+                            )
+                            UfiSwitch(
+                                checked = draftTransitionOff,
+                                onCheckedChange = { draftTransitionOff = it }
+                            )
+                        }
+                        if (!draftTransitionOff) {
+                            // 「动画时长」标签 + 滑块是同一个控件组（标签就是这条滑块的名字），
+                            // 整组作为 body 的单个子级：与上下两个开关行之间 12dp、组内 4dp。
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalArrangement = Arrangement.spacedBy(Spacing.Small)
+                            ) {
+                                Text(
+                                    "动画时长",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = palette.textSecondary
+                                )
+                                UfiSlider(
+                                    value = draftDuration.toFloat(),
+                                    onValueChange = { draftDuration = it.roundToInt() },
+                                    // 区间与档数由 ThemeManager 的 MIN/MAX 推导，不再写死 150f..600f：
+                                    // 150,200,…,600 共 9 档（steps = 档数 - 1 = 8）。
+                                    valueRange = ThemeManager.TRANSITION_DURATION_MIN_MS.toFloat()..
+                                        ThemeManager.TRANSITION_DURATION_MAX_MS.toFloat(),
+                                    steps = (ThemeManager.TRANSITION_DURATION_MAX_MS -
+                                        ThemeManager.TRANSITION_DURATION_MIN_MS) / 50 - 1,
+                                    label = "",
+                                    valueLabel = "${draftDuration}ms",
+                                )
+                            }
+                        }
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                "过渡模糊",
+                                style = UfiTextStyles.listItemTitle,
+                                color = palette.textPrimary
+                            )
+                            UfiSwitch(
+                                checked = draftBlur,
+                                onCheckedChange = { draftBlur = it }
+                            )
+                        }
                     }
-
-                    Spacer(Modifier.height(Spacing.Medium))
-                    Row(
-                        Modifier.fillMaxWidth().padding(horizontal = Spacing.XLarge),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            "过渡模糊",
-                            style = UfiTextStyles.listItemTitle,
-                            color = palette.textPrimary
-                        )
-                        UfiSwitch(
-                            checked = draftBlur,
-                            onCheckedChange = { draftBlur = it }
-                        )
-                    }
-
-                    Spacer(Modifier.height(Spacing.Medium))
                     DialogButtonRow(
                         confirmText = "确认",
                         onConfirm = {
@@ -632,33 +632,39 @@ fun AppearanceSettingsScreen(
                 dismissButton = null,
                 showCloseButton = false
             ) {
-                Text(
-                    "整体缩放界面尺寸，文字与间距一起等比变化。系统的字体大小设置仍按比例生效。",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = palette.textSecondary
-                )
-                Spacer(Modifier.height(Spacing.Medium))
-                UfiSlider(
-                    value = draftScale.toFloat(),
-                    onValueChange = { draftScale = it.roundToInt() },
-                    // 区间与 steps 由 ThemeManager 的 MIN/MAX 推导：90~120 每 5 一档共 7 档
-                    valueRange = ThemeManager.UI_SCALE_PERCENT_MIN.toFloat()..ThemeManager.UI_SCALE_PERCENT_MAX.toFloat(),
-                    steps = (ThemeManager.UI_SCALE_PERCENT_MAX - ThemeManager.UI_SCALE_PERCENT_MIN) / 5 - 1,
-                    label = "",
-                    valueLabel = "${draftScale}%"
-                )
-                Text(
-                    when {
-                        draftScale < ThemeManager.DEFAULT_UI_SCALE_PERCENT ->
-                            "偏小：按钮与图标会小于系统建议的触摸尺寸"
-                        draftScale == ThemeManager.DEFAULT_UI_SCALE_PERCENT -> "默认 100%"
-                        else -> "偏大：部分页面的长文案可能折行增多"
-                    },
-                    style = MaterialTheme.typography.labelSmall,
-                    color = palette.textSecondary.copy(alpha = 0.7f),
-                    modifier = Modifier.padding(horizontal = Spacing.XLarge)
-                )
-                Spacer(Modifier.height(Spacing.Medium))
+                UfiDialogBody {
+                    Text(
+                        "整体缩放界面尺寸，文字与间距一起等比变化。系统的字体大小设置仍按比例生效。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = palette.textSecondary
+                    )
+                    // 缩放滑块 + 它下面那句解释是同一个控件组（说明文字随滑块值变），
+                    // 整组作为 body 的单个子级：与上面的说明段、下面的按钮行之间 12dp、组内 4dp。
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(Spacing.Small)
+                    ) {
+                        UfiSlider(
+                            value = draftScale.toFloat(),
+                            onValueChange = { draftScale = it.roundToInt() },
+                            // 区间与 steps 由 ThemeManager 的 MIN/MAX 推导：90~120 每 5 一档共 7 档
+                            valueRange = ThemeManager.UI_SCALE_PERCENT_MIN.toFloat()..ThemeManager.UI_SCALE_PERCENT_MAX.toFloat(),
+                            steps = (ThemeManager.UI_SCALE_PERCENT_MAX - ThemeManager.UI_SCALE_PERCENT_MIN) / 5 - 1,
+                            label = "",
+                            valueLabel = "${draftScale}%"
+                        )
+                        Text(
+                            when {
+                                draftScale < ThemeManager.DEFAULT_UI_SCALE_PERCENT ->
+                                    "偏小：按钮与图标会小于系统建议的触摸尺寸"
+                                draftScale == ThemeManager.DEFAULT_UI_SCALE_PERCENT -> "默认 100%"
+                                else -> "偏大：部分页面的长文案可能折行增多"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = palette.textSecondary.copy(alpha = 0.7f)
+                        )
+                    }
+                }
                 DialogButtonRow(
                     confirmText = "确认",
                     onConfirm = {
@@ -738,7 +744,9 @@ private fun CustomColorPreview(
     Column(
         Modifier
             .fillMaxWidth()
-            .padding(horizontal = Spacing.XLarge)
+            // 横向内距**不在这里加**：本组件只在弹窗 body 里用，而 body 的水平内距由
+            // UfiDialogShell 的内容列统一给（18dp）。这里再叠 16dp 会变成 34dp，
+            // 预览卡比同一栏里的滑块、说明文字窄一圈。
             .clip(UfiCardDefaults.shape)
             .background(p.pageBg)
             .border(Spacing.ButtonBorderWidth, borderColor, UfiCardDefaults.shape)

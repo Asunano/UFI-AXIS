@@ -7,6 +7,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
@@ -29,6 +32,20 @@ import kotlinx.coroutines.delay
 @Composable
 fun CfTunnelScreen(viewModel: MainViewModel, navController: NavHostController, tunnelName: String) {
     val state by viewModel.tunnelState.collectAsState()
+
+    // ── lifecycle 门控（2026-09-21）──
+    var lifecycleResumed by remember { mutableStateOf(true) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            lifecycleResumed = event == Lifecycle.Event.ON_RESUME
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            lifecycleResumed = false
+        }
+    }
     val palette = LocalResolvedPalette.current
     val clipboard = LocalClipboardManager.current
     var toastMessage by remember { mutableStateOf<ToastMessage?>(null) }
@@ -52,23 +69,25 @@ fun CfTunnelScreen(viewModel: MainViewModel, navController: NavHostController, t
         viewModel.tunnel.refreshCfLog(tunnelName)
     }
 
-    // token 归属判定：cfTokenText 是全局共享 state，不判归属会把上一条隧道的 token 带进本页
-    LaunchedEffect(tunnelName, state.cfTokenName, state.cfTokenText) {
-        if (loadedFor != tunnelName && state.cfTokenName == tunnelName) {
-            tokenText = state.cfTokenText
+    // token 现在按隧道名分桶（state.cfTokens），不会再串台；null = 还没读到过
+    LaunchedEffect(tunnelName, state.cfTokens) {
+        val loaded = state.cfTokenOf(tunnelName)
+        if (loadedFor != tunnelName && loaded != null) {
+            tokenText = loaded
             loadedFor = tunnelName
         }
     }
 
-    LaunchedEffect(logPolling, tunnelName) {
-        while (logPolling) {
+    LaunchedEffect(logPolling, tunnelName, lifecycleResumed) {
+        while (logPolling && lifecycleResumed) {
             viewModel.tunnel.refreshCfLog(tunnelName)
             delay(2000)
         }
     }
 
     // 状态兜底轮询：进程可能自己退出（token 失效）或被别处停掉，不轮询会一直显示"运行中"
-    LaunchedEffect(tunnelName) {
+    LaunchedEffect(tunnelName, lifecycleResumed) {
+        if (!lifecycleResumed) return@LaunchedEffect
         while (true) {
             delay(5000)
             viewModel.tunnel.loadStatus()
@@ -82,7 +101,8 @@ fun CfTunnelScreen(viewModel: MainViewModel, navController: NavHostController, t
     val thisError = instance?.lastError ?: ""
     // 磁盘上是否已存有 token（启停判据用它，不能用编辑框内容：清空输入框不等于删掉 token）
     val tokenSaved = state.cfTunnelItems.firstOrNull { it.name == tunnelName }?.tokenSet == true
-    val tokenDirty = loadedFor == tunnelName && tokenText.trim() != state.cfTokenText.trim()
+    val tokenDirty = loadedFor == tunnelName &&
+        tokenText.trim() != (state.cfTokenOf(tunnelName) ?: "").trim()
     // 日志按隧道取，归属不对就不显示
     val thisLog = state.cfLogOf(tunnelName)
 

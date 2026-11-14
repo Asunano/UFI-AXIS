@@ -9,6 +9,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import com.ufi_axis.data.model.NotifyLevelOptionDto
+import com.ufi_axis.ui.components.common.LocalUfiDialogClose
 import com.ufi_axis.ui.components.common.UfiButton
 import com.ufi_axis.ui.components.common.UfiButtonVariant
 import com.ufi_axis.ui.components.common.UfiCustomDialog
@@ -279,14 +280,18 @@ internal fun NotifyDailyLimitDialog(
         onDismiss = onDismiss,
         title = "每日上限",
         confirmButton = {
+            // 关闭动作交给 shell 排时序：离场 backdrop（逐渐清晰）要播完才卸载窗口，
+            // 见 LocalUfiDialogClose；必须在 slot 内部读，弹窗外读到的是"直接执行"的默认实现。
+            val close = LocalUfiDialogClose.current
             UfiButton(
                 text = "保存",
                 enabled = error == null && !saving,
-                onClick = { if (value != null) onSave(value) }
+                onClick = { close { if (value != null) onSave(value) } }
             )
         },
         dismissButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = onDismiss)
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close(onDismiss) })
         }
     ) {
         UfiDialogBody {
@@ -341,9 +346,13 @@ internal fun NotifyScenesDialog(
         visible = true,
         onDismiss = onDismiss,
         title = title,
-        confirmButton = { UfiButton(text = "保存", onClick = { onSave(draft.toList()) }) },
+        confirmButton = {
+            val close = LocalUfiDialogClose.current
+            UfiButton(text = "保存", onClick = { close { onSave(draft.toList()) } })
+        },
         dismissButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = onDismiss)
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close(onDismiss) })
         }
     ) {
         UfiDialogBody {
