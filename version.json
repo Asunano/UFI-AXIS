@@ -1,33 +1,33 @@
 {
   "frontend": {
-    "version": "0.1.1",
-    "versionCode": 6,
-    "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.1.1/UFI-AXIS-app-0.1.1.apk",
-    "apkSha256": "6110d90ea725c804da50179023f56223731638d64d2193a0f40d976d6ec609bb",
-    "changelog": "App 端更新：\n- 新增话费账单：多账号并存（移动 / 联通 / 云上卡 / 小鲸卡），余额、流量、套餐与到期\n- 新增自动登录与保活：会话失效自动收码重登，可设检查间隔、重登间隔与每日短信上限（仅中国移动，需 SIM 在本机）\n- 新增远程投屏：基于 scrcpy 3.3.3，画质三档可调，支持触控与键盘\n- 新增应用商店：OpenList / Syncthing / Cloudreve / dufs / ddns-go 的安装、启停、日志与访问\n- 新增「不可逆操作保护」：恢复出厂、恢复备份、root shell、删除全部日志、移除配对设备等操作需再输一次配对密码\n- 新增日志导出；二级页切换更跟手；状态栏图标跟随应用内明暗\n- 修复：被其他设备移除配对后不退出登录（需重启才生效）；顶栏天气与今日诗词在启动时取不到数据后永久空白；配对密码说明文案错误\n- 修复：二级页连按返回会直接退出 App；顶栏返回在个别状态下点不动",
-    "apkSize": 9897393,
-    "publishedAt": "2026-11-15T02:27:55Z",
-    "tagName": "v0.1.1"
+    "version": "0.1.2",
+    "versionCode": 7,
+    "apkUrl": "",
+    "apkSha256": "",
+    "changelog": "App 端更新：\n- 修复：播放页在小屏上会裁掉歌词（现在整页按可用高度等比缩放）\n- 修复：歌词会突然跳回第一句（当前句索引为 -1 时被当成第 0 句；拖动播放页时也会被测量打断）\n- 修复：顶栏天气取数失败后不再空到下次冷启动，改为 30s / 2 分钟 / 5 分钟自动重试\n- 改进：顶栏挂件「暂停满 1 分钟」就换回天气（以前有播放卡片就一直占着）\n- 改进：更新弹窗下载中只显示进度圆环，底部按钮变「取消 / 后台进行」，取消可真的停掉下载\n- 改进：天气图标改分部件动效（雨丝在落、雪花在飘、雾带在扫、闪电按节拍闪），并按强度区分 2/3/5 档\n- 改进：设置页下拉框不再在右侧留空洞",
+    "apkSize": 0,
+    "publishedAt": "",
+    "tagName": ""
   },
   "backend": {
-    "version": "0.1.1",
-    "versionCode": 6,
-    "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.1.1/UFI-AXIS-core-0.1.1.apk",
-    "apkSha256": "8ecdce55f3f4dd6ffab2a3cb0a9f2342abecfd7c8927822c2ed8ac71b11f194b",
-    "changelog": "Core 管理后台（含 Web 前端，随 Core 一同发布）：\n- 新增运营商账单接口 /api/carrier（23 个端点）：移动、联通、云上卡、小鲸卡四类账号；\n  移动验证码、联通扫码、联通服务密码、物联卡云端登录；账单、流量与自动登录保活（仅移动）\n- 新增远程投屏 /api/screen（3 个端点）与 /ws/screen：自研 adb 协议客户端 + scrcpy-server 3.3.3，支持截屏\n- 新增应用商店 /api/programs（15 个端点 + 公开入口）：多实例运行、内存总量预算、内容目录可选、\n  Gateway 转发与 60 秒一次性入口票据\n- 新增「不可逆操作保护」：24 个不可逆/交出凭据的端点可要求配对密码，另有两个条件门\n  （改 goform 地址要密码、关闭保护本身要密码）；安装/更新/隧道/终端不受影响\n- 存储卷枚举统一，文件管理与应用商店共用同一份\n- 修复：网络制式 ENDC / EN-DC / NSA 统一显示为「5G NSA」",
-    "apkSize": 25902173,
-    "publishedAt": "2026-11-15T02:27:55Z",
-    "tagName": "v0.1.1"
+    "version": "0.1.2",
+    "versionCode": 7,
+    "apkUrl": "",
+    "apkSha256": "",
+    "changelog": "Core 管理后台（含 Web 前端，随 Core 一同发布）：\n- 本轮无接口变更；随 App 一同重发，便于三端版本对齐\n- Web 端：无改动",
+    "apkSize": 0,
+    "publishedAt": "",
+    "tagName": ""
   },
   "web": {
-    "version": "0.1.1",
-    "versionCode": 6,
-    "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.1.1/web-update-0.1.1.zip",
-    "apkSha256": "47ae2debb9d18c87de393b7908c85ed0df0f78e51bda7c747fd51e171239f255",
-    "changelog": "随 Core 端（管理后台）一同发布，更新内容见 Core 端更新日志。\n本轮新增：\n- 话费账单页：多账号并存（移动 / 联通 / 云上卡 / 小鲸卡），余额、流量、套餐与到期\n- 远程投屏页：scrcpy 画面与触控/键盘\n- 应用商店页：安装、启停、日志与访问\n- 全局致命错误浮层：组件异常不再白屏，给出可关闭的提示与刷新入口",
-    "apkSize": 2060421,
-    "publishedAt": "2026-11-15T02:27:55Z",
-    "tagName": "v0.1.1"
+    "version": "0.1.2",
+    "versionCode": 7,
+    "apkUrl": "",
+    "apkSha256": "",
+    "changelog": "随 Core 端（管理后台）一同发布。\n本轮 Web 前端无功能改动，仅跟随版本号重发。",
+    "apkSize": 0,
+    "publishedAt": "",
+    "tagName": ""
   },
   "components": {
     "frpc": {
