@@ -16,6 +16,8 @@ android {
 }
 
 dependencies {
+    // 媒体页的「歌词页不画飞行封面」等状态机有单测（2026-11-15），与 feature-tools / ui 同一口径
+    testImplementation(libs.junit)
     implementation(project(":app:viewmodel"))
     implementation(project(":app:data"))
     implementation(project(":app:ui"))

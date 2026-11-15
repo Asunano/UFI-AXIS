@@ -1119,11 +1119,18 @@ class ToolsModule(
                 val frontendObj = root["frontend"]?.jsonObject ?: root
                 val info = AppJson.decodeFromJsonElement<FrontendUpdateInfo>(frontendObj)
                 val current = currentAppVersionName()
+                val currentCode = currentAppVersionCode()
                 val latest = info.version
-                // current 为空 = PackageManager 读取失败，此时任何比较都不可信
-                // （空串解析成 [] → 全按 0 → 恒判定"有新版"），宁可不提示也不能误导用户重复安装
-                val hasUpdate = latest.isNotBlank() && current.isNotBlank() &&
-                    compareVersions(latest, current) > 0
+                // 2026-11-15：原先只比版本名，于是「同名重发」（0.1.1 抬 versionCode 到 6）
+                // 完全检测不到 —— 已装 0.1.1(5) 的用户永远显示"已是最新"。
+                // 现在版本名优先、名字相同再看 versionCode（不降级），判定逻辑在
+                // `:core:contract` 的 `hasUpdate` 里，带单测。
+                val hasUpdate = com.ufi_axis_core.contract.hasUpdate(
+                    latestName = latest,
+                    latestCode = info.versionCode,
+                    currentName = current,
+                    currentCode = currentCode,
+                )
                 _frontendUpdateState.update { prev ->
                     // 同一版本的下载成果需保留：若以 `FrontendUpdateState(...)` 构造调用，
                     // 会把 downloadProgress/downloadedApkPath 一起清 0/清 null，于是
@@ -1266,6 +1273,32 @@ class ToolsModule(
         }
     }
 
+    /**
+     * 当前 App 的 versionCode（PackageManager 读取，禁止硬编码）。
+     *
+     * 与版本名一起构成更新判据：同名重发（版本名不变、只抬 versionCode）只有靠它才认得出来。
+     * 读取失败返回 0 —— `hasUpdate` 会在"名字相同且 code 拿不到"时判为无更新，
+     * 宁可漏提示也不误导用户重装同一个包。
+     */
+    private fun currentAppVersionCode(): Int = try {
+        val pm = appContext.packageManager
+        val info = if (android.os.Build.VERSION.SDK_INT >= 33) {
+            pm.getPackageInfo(appContext.packageName, android.content.pm.PackageManager.PackageInfoFlags.of(0))
+        } else {
+            @Suppress("DEPRECATION")
+            pm.getPackageInfo(appContext.packageName, 0)
+        }
+        if (android.os.Build.VERSION.SDK_INT >= 28) {
+            info.longVersionCode.toInt()
+        } else {
+            @Suppress("DEPRECATION")
+            info.versionCode
+        }
+    } catch (e: Exception) {
+        DebugLog.w("Tools", "读取 App versionCode 失败: ${e.message}")
+        0
+    }
+
     /** 当前 App 版本名（PackageManager 读取，禁止硬编码） */
     private fun currentAppVersionName(): String = try {
         val pm = appContext.packageManager
@@ -1289,20 +1322,8 @@ class ToolsModule(
      * 2>1 判定"有新版"，装完版本名没变，于是每次检查都提示更新、重复下载。
      * 与 core 的 `UpdateManager.compareVersions` 保持同一套解析规则。
      */
-    private fun compareVersions(v1: String, v2: String): Int {
-        fun parse(v: String): List<Int> = v.trim()
-            .removePrefix("v").removePrefix("V")
-            .split('.', '-', '_', '+')
-            .map { seg -> seg.takeWhile(Char::isDigit).toIntOrNull() ?: 0 }
-        val p1 = parse(v1)
-        val p2 = parse(v2)
-        for (i in 0 until maxOf(p1.size, p2.size)) {
-            val a = p1.getOrElse(i) { 0 }
-            val b = p2.getOrElse(i) { 0 }
-            if (a != b) return a.compareTo(b)
-        }
-        return 0
-    }
+    private fun compareVersions(v1: String, v2: String): Int =
+        com.ufi_axis_core.contract.compareVersionNames(v1, v2)
 
     // ══════════════ 运行诊断 ══════════════
     // 五个只读端点一次并发拉齐。任一失败只打日志、保留上一次的值，不写 errorMessage ——
