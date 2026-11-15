@@ -260,6 +260,25 @@ internal object UfiAudioRisePanel {
     var flyingCoverReadyUrl by mutableStateOf<String?>(null)
         private set
 
+    /**
+     * 播放页当前是否停在「封面」页（由 `MediaAudioPlayerScreen` 根据 Pager 上报）。
+     *
+     * ## 为什么要这个开关（2026-11-15）
+     * 飞行封面（[UfiRiseFlyingCover]）是按**最后一次上报的封面槽**绘制的，与"此刻画面里
+     * 有没有封面"无关。播放页有「封面 / 歌词」两页，切到歌词页后封面已经翻到屏幕外，
+     * 但槽位坐标还留着 —— 此时下拉关闭，用户会看到一张封面**凭空闪一下**再跟着走，
+     * 而这一页自始至终没有封面。所以歌词页直接不让它画，收起就是纯粹的整页下滑。
+     *
+     * 默认 true：面板第一次升起时总是落在封面页（`rememberPagerState(initialPage = 封面)`）。
+     */
+    var coverPageVisible by mutableStateOf(true)
+        private set
+
+    /** 播放页翻到封面 / 歌词页时调用。 */
+    fun reportCoverPageVisible(visible: Boolean) {
+        if (coverPageVisible != visible) coverPageVisible = visible
+    }
+
     /** 飞行封面把图**画出来了**（只有非空 URL 才会调用）。 */
     fun markFlyingCoverReady(url: String) {
         if (flyingCoverReadyUrl != url) flyingCoverReadyUrl = url
@@ -586,6 +605,8 @@ internal object UfiAudioRisePanel {
         // 起点位置与封面槽也一起清：留着上一页那一张封面的矩形，下一页第一次拖动会从别人的位置飞过来
         followSources = emptyMap()
         coverSlot = null
+        // 下次升起总是落在封面页
+        coverPageVisible = true
         // 背景页的效果属于"这一次手势"，宿主没了必须一起收 —— 否则下一页会带着一层糊
         clearBackdrop()
     }
@@ -946,6 +967,11 @@ private fun UfiRiseFlyingCover() {
                 val travel = UfiAudioRisePanel.travelPx
                 val offset = UfiAudioRisePanel.offsetPx
                 val raw = slot
+                // 歌词页没有封面可跟：照画只会让用户看到一张凭空出现的封面闪一下
+                if (!UfiAudioRisePanel.coverPageVisible) {
+                    alpha = 0f
+                    return@graphicsLayer
+                }
                 if (from == null || raw == null || travel <= 0f) {
                     alpha = 0f
                     return@graphicsLayer

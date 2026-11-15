@@ -776,6 +776,20 @@ fun MediaAudioPlayerScreen(
     val pagerScope = rememberCoroutineScope()
 
     /*
+     * 把"当前停在封面页还是歌词页"报给跟手面板（2026-11-15）。
+     *
+     * 歌词页根本看不到封面，但面板的飞行封面按**最后一次上报的封面槽**绘制 ——
+     * 不拦的话在歌词页下拉关闭会先闪出一张封面再跟着滑，用户报的就是这个。
+     * 这里只观察 `currentPage`（不读 `currentPageOffsetFraction`）：滑到一半时按当前页算，
+     * 与"松手后会停在哪一页"一致即可。
+     */
+    LaunchedEffect(pagerState) {
+        snapshotFlow { pagerState.currentPage }.collect { page ->
+            UfiAudioRisePanel.reportCoverPageVisible(page == AUDIO_PAGE_COVER)
+        }
+    }
+
+    /*
      * 返回键只拦截**队列面板**这一层浮层。
      *
      * 歌词页不拦截：Tab 始终可见（点击即回封面），也可左右划切换，无需占用返回键。
