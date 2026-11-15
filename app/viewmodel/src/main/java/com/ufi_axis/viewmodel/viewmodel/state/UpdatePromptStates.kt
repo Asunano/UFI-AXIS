@@ -44,6 +44,24 @@ data class UpdatePromptState(
     /** App 侧检查或下载失败（只在弹窗已经打开时展示，不作为自动弹出的理由）。 */
     val appFailed: Boolean get() = app.state == "error"
 
+    /**
+     * core 更新正在进行（下载 / 校验 / 安装）。
+     *
+     * 与 `coreTriggered` 的区别：后者含"已触发但还没读到状态"和终态。
+     * 只有这一档才需要把内容区换成进度环、并给出「取消 / 后台进行」。
+     */
+    val coreRunning: Boolean
+        get() = coreTriggered && coreStatus?.state?.lowercase() in CORE_RUNNING_STATES
+
+    /**
+     * core 此刻能不能取消。
+     *
+     * 只有下载 / 校验可以：安装一旦开始（`installing`）就不能中断，
+     * 打断会把设备留在"装了半个包"的状态（服务端 `UpdateManager.cancel` 同样只接受这两态）。
+     */
+    val coreCancelable: Boolean
+        get() = coreTriggered && coreStatus?.state?.lowercase() in CORE_CANCELABLE_STATES
+
     /** 是否有**任何**可提示的更新 —— 自动弹出的唯一判据。 */
     val hasAnyUpdate: Boolean get() = appHasUpdate || coreHasUpdate
 
@@ -52,3 +70,9 @@ data class UpdatePromptState(
         val APP_ACTIONABLE_STATES = setOf("available", "downloading", "downloaded", "installing")
     }
 }
+
+/** core 更新"正在进行"的状态集合（服务端 statusToMap 的小写口径）。 */
+private val CORE_RUNNING_STATES = setOf("downloading", "verifying", "installing", "uploading")
+
+/** core 更新"可以取消"的状态集合：安装开始前。 */
+private val CORE_CANCELABLE_STATES = setOf("downloading", "verifying")

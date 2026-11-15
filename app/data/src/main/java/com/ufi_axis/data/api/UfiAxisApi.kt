@@ -963,6 +963,15 @@ interface UfiAxisApi {
     @POST("api/update/check")
     suspend fun triggerDeviceUpdate(): UpdateStatusResponse
 
+    /**
+     * 取消正在进行的 core 自动更新（2026-11-15）。
+     *
+     * 服务端只接受 `downloading` / `verifying`：安装一旦开始就不能中断。
+     * 不可取消时同样返回 200 + 当前状态，由 UI 按 `state` 决定提示。
+     */
+    @POST("api/update/cancel")
+    suspend fun cancelDeviceUpdate(): UpdateStatusResponse
+
     @GET("api/update/status")
     suspend fun getDeviceUpdateStatus(): UpdateStatusResponse
 

@@ -11,8 +11,12 @@ import com.ufi_axis_core.util.AppSettings
 import com.ufi_axis_core.util.LogPaths
 import com.ufi_axis_core.util.ShellExecutor
 import com.ufi_axis_core.api.routes.statusToMap
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -267,7 +271,7 @@ class UpdateManager(
      * 逐候选下载 APK，返回文件 SHA-256。
      * 换候选前清掉半截 `.part`，避免上一个候选的残留字节混进下一次下载。
      */
-    private fun downloadApkWithFallback(rawUrl: String, target: File, timeoutMs: Int = 60_000): String {
+    private suspend fun downloadApkWithFallback(rawUrl: String, target: File, timeoutMs: Int = 60_000): String {
         val candidates = MirrorResolver.candidates(settings, rawUrl)
         if (candidates.isEmpty()) throw Exception("APK 下载地址为空")
         val errors = mutableListOf<String>()
@@ -290,7 +294,7 @@ class UpdateManager(
 
     /** 触发检查 + 自动更新（异步；立即返回当前状态，进度经 [status] 轮询） */
     fun checkAndUpdate() {
-        scope.launch {
+        updateJob = scope.launch {
             // 互斥：进行中（DOWNLOADING/VERIFYING/INSTALLING/UPLOADING）或已被其他入口占用 → 忽略重复触发
             if (status.state in BUSY_STATES || !tryAcquireUpdate()) {
                 AppLogger.i(TAG, "checkAndUpdate 忽略重复触发 (state=${status.state})")
@@ -474,6 +478,13 @@ class UpdateManager(
                 // 自更新路径在此返回时不释放锁 —— 锁的生命周期已移交安装线程
                 // （失败或异常时由它释放）或随进程结束。外层 finally 需要该标志判断。
                 selfUpdateInstallLaunched = true
+            } catch (e: CancellationException) {
+                // 用户点了「取消」：不是失败，回到干净状态即可
+                AppLogger.i(TAG, "checkAndUpdate 已取消")
+                status = status.copy(state = State.IDLE, progress = 0, message = "已取消更新（尚未开始安装）")
+                logUpdateFile("checkAndUpdate CANCELLED by user")
+                broadcastUpdate()
+                throw e
             } catch (e: NeedPushException) {
                 // 更新源不可用（不可达 / 非 JSON / 下载失败）→ NEED_PUSH，引导前端使用推送兜底
                 AppLogger.w(TAG, "checkAndUpdate 更新源不可用: ${e.message}")
@@ -895,6 +906,51 @@ class UpdateManager(
         } else {
             status = status.copy(state = State.FAILED, message = errorMessage ?: "上传失败")
         }
+    }
+
+    /**
+     * 取消正在进行的自动更新（2026-11-15 新增）。
+     *
+     * ## 为什么只能在"还没开始安装"之前取消
+     * 安装一旦启动就是 `pm install` + 进程重启，中途打断会把设备留在"装了半个包"的状态。
+     * 所以只接受 [State.DOWNLOADING] / [State.VERIFYING]：这两个阶段全部是下载与校验，
+     * 取消后删掉 `.part` 即可，没有任何副作用。
+     *
+     * ## 与 [reset] 的区别
+     * `reset()` 只把状态清回 IDLE，**下载协程仍在跑**，几秒后又会把 status 写回
+     * DOWNLOADING —— 前端看到的就是"取消不掉"。本方法会真正 cancel 协程。
+     *
+     * @return 取消后的状态；不可取消时原样返回当前状态（调用方据此提示）。
+     */
+    fun cancel(): UpdateStatus {
+        val state = status.state
+        if (state != State.DOWNLOADING && state != State.VERIFYING) {
+            AppLogger.i(TAG, "cancel 忽略：当前状态 $state 不可取消")
+            return status
+        }
+        AppLogger.i(TAG, "cancel：取消本次更新（state=$state）")
+        val job = updateJob
+        if (job == null) {
+            // 没有在跑的协程（理论上不该走到这里）：只把状态摆正，不碰互斥锁
+            status = status.copy(state = State.IDLE, progress = 0, message = "已取消更新（尚未开始安装）")
+            return status
+        }
+        updateJob = null
+        // ⚠ **不要**在这里 releaseUpdate()：协程被 cancel 后仍会跑 finally，由它释放。
+        // 在这里提前释放会让下一次 checkAndUpdate 立刻抢到锁，两个下载同时写同一个 .part 文件。
+        job.cancel(CancellationException("user-cancel"))
+        status = UpdateStatus(
+            state = State.IDLE,
+            progress = 0,
+            message = "已取消更新（尚未开始安装）",
+            currentVersion = currentVersionName(),
+            latestVersion = status.latestVersion
+        )
+        cleanupInstallArtifacts("cancelled")
+        logUpdateFile("cancel: 用户取消更新")
+        // broadcastUpdate 是 suspend（要写 WS 频道），本方法是同步 API —— 投递出去即可
+        scope.launch { broadcastUpdate() }
+        return status
     }
 
     /** 重置状态（UI 关闭/重试前）。同时清掉上传残留，避免固定文件名被旧包占位。 */
@@ -1439,6 +1495,15 @@ class UpdateManager(
 
     // ── 互斥 ──
 
+    /**
+     * 正在跑的自动更新协程（2026-11-15 新增，供 [cancel] 用）。
+     *
+     * 此前没有句柄，`reset()` 只能把状态清回 IDLE，**下载协程照跑**，
+     * 几秒后又会把 status 写回 DOWNLOADING —— 前端看到的就是"取消不掉"。
+     */
+    @Volatile
+    private var updateJob: Job? = null
+
     private fun tryAcquireUpdate(): Boolean = updateMutex.compareAndSet(false, true)
 
     private fun releaseUpdate() {
@@ -1495,7 +1560,7 @@ class UpdateManager(
      * 流式下载 APK 到文件（.part 原子写 + 磁盘预检），返回文件 SHA-256 hex。
      * 下载前删除旧 .part；失败抛异常（由调用方清理 .part）。
      */
-    private fun downloadApk(urlStr: String, target: File, timeoutMs: Int = 60_000): String {
+    private suspend fun downloadApk(urlStr: String, target: File, timeoutMs: Int = 60_000): String {
         var conn: HttpURLConnection? = null
         try {
             conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
@@ -1528,6 +1593,9 @@ class UpdateManager(
             input.use { ins ->
                 output.use { outs ->
                     while (true) {
+                        // 每读一块检查一次取消：协程被 cancel 后 64KB 内就会退出，
+                        // 否则用户点了「取消」还要等下载跑完
+                        currentCoroutineContext().ensureActive()
                         val n = ins.read(buf)
                         if (n < 0) break
                         outs.write(buf, 0, n)

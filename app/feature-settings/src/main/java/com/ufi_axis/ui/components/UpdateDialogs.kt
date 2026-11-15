@@ -614,6 +614,7 @@ fun UnifiedUpdateDialog(
     onDownloadApp: () -> Unit,
     onInstallApp: () -> Unit,
     onCancelDownload: () -> Unit,
+    onCancelCoreUpdate: () -> Unit,
     onCoreUpdateConfirmed: () -> Unit
 ) {
     val palette = LocalResolvedPalette.current
@@ -630,6 +631,12 @@ fun UnifiedUpdateDialog(
      * · 底部按钮从单颗「稍后」变成「左取消 / 右后台进行」。
      */
     val appDownloading = state.showAppSection && state.app.state == "downloading"
+    /*
+     * core 侧同一套（2026-11-15）：此前只有 App 弹窗享受「进度环 + 取消/后台进行」，
+     * core 一旦触发就只剩一颗「稍后」，且更新日志照旧堆在环上面，看不出"到底在干什么"。
+     */
+    val coreRunning = state.coreRunning
+    val coreCancelable = state.coreCancelable
 
     UfiScrollableDialog(
         visible = state.visible,
@@ -659,6 +666,8 @@ fun UnifiedUpdateDialog(
                 // App 包下载中：右侧是「后台进行」—— 关掉弹窗、下载继续
                 // （与「取消」成对：一个只是收起界面，一个是真的停掉任务）
                 appDownloading -> UfiButton(text = "后台进行", onClick = { close(onDismiss) })
+                // core 更新进行中：右侧是「后台进行」—— 关掉弹窗，core 继续下载/安装
+                coreRunning -> UfiButton(text = "后台进行", onClick = { close(onDismiss) })
                 coreConfirming -> UfiButton(
                     text = "确认更新 Core",
                     onClick = {
@@ -680,11 +689,15 @@ fun UnifiedUpdateDialog(
                 // 下载中左键是「取消」：它会真的停掉下载任务（2026-11-15 用户要求）
                 text = when {
                     appDownloading -> "取消"
+                    coreCancelable -> "取消"
                     state.hasAnyUpdate -> "稍后"
                     else -> "关闭"
                 },
                 onClick = {
-                    if (appDownloading) onCancelDownload()
+                    when {
+                        appDownloading -> onCancelDownload()
+                        coreCancelable -> onCancelCoreUpdate()
+                    }
                     close(onDismiss)
                 }
             )
@@ -716,9 +729,20 @@ fun UnifiedUpdateDialog(
                     name = "UFI-AXIS Core（设备端）",
                     currentVersion = state.coreCurrentVersion,
                     latestVersion = state.coreLatestVersion,
-                    changelog = state.coreChangelog
+                    changelog = state.coreChangelog,
+                    // 进行中：日志让位给进度环（与 App 段同一规则）
+                    showChangelog = !coreRunning
                 ) {
                     CoreUpdateProgressOnly(state = state)
+                    // 安装开始后不能取消 —— 明说，别让用户以为按钮坏了
+                    if (coreRunning && !coreCancelable) {
+                        Text(
+                            text = "安装已开始，此阶段无法取消；请保持设备供电。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = LocalResolvedPalette.current.textSecondary,
+                            modifier = Modifier.padding(top = Spacing.Small)
+                        )
+                    }
                 }
             }
         }

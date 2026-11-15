@@ -727,6 +727,36 @@ class ToolsModule(
     }
 
     /**
+     * 取消正在进行的 core 自动更新（2026-11-15）。
+     *
+     * 只对「还没开始安装」的阶段有效（core 侧 `UpdateManager.cancel` 的约束）：
+     * 下载/校验中 → 真正停掉并删掉半包；已进入安装 → core 原样返回当前状态，
+     * UI 会看到 state 仍是 installing，据此提示"已在安装，无法取消"。
+     *
+     * 成功后同时收掉轮询任务并清除"core 更新中"标记，否则 App 会继续以更新态
+     * 豁免各种请求。
+     */
+    fun cancelDeviceUpdate() {
+        scope.launch {
+            runCatching { api.cancelDeviceUpdate() }
+                .onSuccess { st ->
+                    _updateDeviceState.value = st
+                    if (!UPDATE_BUSY_STATES.contains(st.state.lowercase())) {
+                        updatePollJob?.cancel()
+                        updatePollJob = null
+                        markCoreUpdating(false)
+                    }
+                }
+                .onFailure { e ->
+                    DebugLog.w("Update", "cancelDeviceUpdate 失败: ${e.message}")
+                    _updateDeviceState.value = _updateDeviceState.value?.copy(
+                        message = "取消失败：${e.message}"
+                    )
+                }
+        }
+    }
+
+    /**
      * 轮询设备更新状态：失败连续 3 次 → 过渡态「设备重启中…」，恢复后清除；
      * 连续失败超过 150 次（约 2s×150 ≈ 5 分钟）→ 失联提示「设备更新可能失败」。
      * Core 主动重启（force-stop + startservice）期间 8088 不可达，轮询会短暂失败，

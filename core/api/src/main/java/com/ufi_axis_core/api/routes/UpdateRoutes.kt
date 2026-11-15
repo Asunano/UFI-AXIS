@@ -177,6 +177,18 @@ class UpdateRoutes(
             }
 
             // 兜底：安装已上传的本地 APK
+            /**
+             * 取消正在进行的自动更新（2026-11-15）。
+             *
+             * 只对 DOWNLOADING / VERIFYING 生效：安装一旦开始就不能中断（见 UpdateManager.cancel）。
+             * 不可取消时同样回 200 + 当前状态，由前端按 `state` 决定提示，不用错误码区分 ——
+             * 这不是错误，只是"来不及了"。
+             */
+            post("/cancel") {
+                updateManager.cancel()
+                call.respond(toJsonElement(updateManager.statusToMap()))
+            }
+
             post("/install-local") {
                 val body = call.receiveJsonObject()
                 val path = body["apk_path"]?.jsonPrimitive?.contentOrNull
