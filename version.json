@@ -3,30 +3,30 @@
     "version": "0.1.1",
     "versionCode": 6,
     "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.1.1/UFI-AXIS-app-0.1.1.apk",
-    "apkSha256": "350e5a23b4d9af80cad2531a7460b34684d47437d5e12abf3ba66d8299900906",
+    "apkSha256": "d68885104c9c731c118054bd8a13ca334935eab3397c0fd2850707233d8feb83",
     "changelog": "App 端更新：\n- 新增话费账单：多账号并存（移动 / 联通 / 云上卡 / 小鲸卡），余额、流量、套餐与到期\n- 新增自动登录与保活：会话失效自动收码重登，可设检查间隔、重登间隔与每日短信上限（仅中国移动，需 SIM 在本机）\n- 新增远程投屏：基于 scrcpy 3.3.3，画质三档可调，支持触控与键盘\n- 新增应用商店：OpenList / Syncthing / Cloudreve / dufs / ddns-go 的安装、启停、日志与访问\n- 新增「不可逆操作保护」：恢复出厂、恢复备份、root shell、删除全部日志、移除配对设备等操作需再输一次配对密码\n- 新增日志导出；二级页切换更跟手；状态栏图标跟随应用内明暗\n- 修复：被其他设备移除配对后不退出登录（需重启才生效）；顶栏天气与今日诗词在启动时取不到数据后永久空白；配对密码说明文案错误\n- 修复：二级页连按返回会直接退出 App；顶栏返回在个别状态下点不动",
     "apkSize": 9897393,
-    "publishedAt": "2026-11-14T18:36:04Z",
+    "publishedAt": "2026-11-15T01:44:38Z",
     "tagName": "v0.1.1"
   },
   "backend": {
     "version": "0.1.1",
     "versionCode": 6,
     "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.1.1/UFI-AXIS-core-0.1.1.apk",
-    "apkSha256": "6f906a61d8e515b6d6b45d4714edd85efbedcddc13fa2e7656d66a1d87bf6e2c",
+    "apkSha256": "b66c06c0f2be802ddfa3b5c4d46225511304b513270e5b231bf0cd76d9f4184a",
     "changelog": "Core 管理后台（含 Web 前端，随 Core 一同发布）：\n- 新增运营商账单接口 /api/carrier（23 个端点）：移动、联通、云上卡、小鲸卡四类账号；\n  移动验证码、联通扫码、联通服务密码、物联卡云端登录；账单、流量与自动登录保活（仅移动）\n- 新增远程投屏 /api/screen（3 个端点）与 /ws/screen：自研 adb 协议客户端 + scrcpy-server 3.3.3，支持截屏\n- 新增应用商店 /api/programs（15 个端点 + 公开入口）：多实例运行、内存总量预算、内容目录可选、\n  Gateway 转发与 60 秒一次性入口票据\n- 新增「不可逆操作保护」：24 个不可逆/交出凭据的端点可要求配对密码，另有两个条件门\n  （改 goform 地址要密码、关闭保护本身要密码）；安装/更新/隧道/终端不受影响\n- 存储卷枚举统一，文件管理与应用商店共用同一份\n- 修复：网络制式 ENDC / EN-DC / NSA 统一显示为「5G NSA」",
     "apkSize": 25902173,
-    "publishedAt": "2026-11-14T18:36:04Z",
+    "publishedAt": "2026-11-15T01:44:38Z",
     "tagName": "v0.1.1"
   },
   "web": {
     "version": "0.1.1",
     "versionCode": 6,
     "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.1.1/web-update-0.1.1.zip",
-    "apkSha256": "e3957c7299a50d5be6d3e56db817af2ccfc5350298306b6600b087f469dd01a1",
+    "apkSha256": "cd94345c54bb96ececad74605ea8e7262cfb4349199ada2f31feb3ceca4a6c88",
     "changelog": "随 Core 端（管理后台）一同发布，更新内容见 Core 端更新日志。\n本轮新增：\n- 话费账单页：多账号并存（移动 / 联通 / 云上卡 / 小鲸卡），余额、流量、套餐与到期\n- 远程投屏页：scrcpy 画面与触控/键盘\n- 应用商店页：安装、启停、日志与访问\n- 全局致命错误浮层：组件异常不再白屏，给出可关闭的提示与刷新入口",
     "apkSize": 2060421,
-    "publishedAt": "2026-11-14T18:36:04Z",
+    "publishedAt": "2026-11-15T01:44:38Z",
     "tagName": "v0.1.1"
   },
   "components": {
