@@ -2,32 +2,32 @@
   "frontend": {
     "version": "0.1.2",
     "versionCode": 7,
-    "apkUrl": "",
-    "apkSha256": "",
+    "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.1.2/UFI-AXIS-app-0.1.2.apk",
+    "apkSha256": "e0857df5b1c43b275e274d33bb3300b1be5e6db0f62de4e8e3782588f1f31f9e",
     "changelog": "App 端更新：\n- 修复：播放页在小屏上会裁掉歌词（现在整页按可用高度等比缩放）\n- 修复：歌词会突然跳回第一句（当前句索引为 -1 时被当成第 0 句；拖动播放页时也会被测量打断）\n- 修复：顶栏天气取数失败后不再空到下次冷启动，改为 30s / 2 分钟 / 5 分钟自动重试\n- 改进：顶栏挂件「暂停满 1 分钟」就换回天气（以前有播放卡片就一直占着）\n- 改进：更新弹窗下载中只显示进度圆环，底部按钮变「取消 / 后台进行」，取消可真的停掉下载\n- 改进：天气图标改分部件动效（雨丝在落、雪花在飘、雾带在扫、闪电按节拍闪），并按强度区分 2/3/5 档\n- 改进：设置页下拉框不再在右侧留空洞",
-    "apkSize": 0,
-    "publishedAt": "",
-    "tagName": ""
+    "apkSize": 9909456,
+    "publishedAt": "2026-11-15T06:41:55Z",
+    "tagName": "v0.1.2"
   },
   "backend": {
     "version": "0.1.2",
     "versionCode": 7,
-    "apkUrl": "",
-    "apkSha256": "",
+    "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.1.2/UFI-AXIS-core-0.1.2.apk",
+    "apkSha256": "21382f441316ddf667f7afc909f2d47f1afb3f54a9b27a4b097c9e8277a01c96",
     "changelog": "Core 管理后台（含 Web 前端，随 Core 一同发布）：\n- 本轮无接口变更；随 App 一同重发，便于三端版本对齐\n- Web 端：无改动",
-    "apkSize": 0,
-    "publishedAt": "",
-    "tagName": ""
+    "apkSize": 25902173,
+    "publishedAt": "2026-11-15T06:41:55Z",
+    "tagName": "v0.1.2"
   },
   "web": {
     "version": "0.1.2",
     "versionCode": 7,
-    "apkUrl": "",
-    "apkSha256": "",
+    "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.1.2/web-update-0.1.2.zip",
+    "apkSha256": "373995e6a2b7b3885758e1768ffaa99c1a43927b6c7ccc9871fbb9daed4425a9",
     "changelog": "随 Core 端（管理后台）一同发布。\n本轮 Web 前端无功能改动，仅跟随版本号重发。",
-    "apkSize": 0,
-    "publishedAt": "",
-    "tagName": ""
+    "apkSize": 2060420,
+    "publishedAt": "2026-11-15T06:41:55Z",
+    "tagName": "v0.1.2"
   },
   "components": {
     "frpc": {
