@@ -236,8 +236,9 @@ fun UfiAudioNowPlayingProbe(viewModel: MainViewModel) {
      * - 还在放 → 一直占着；**一按播放立刻回来**（这个 effect 会因 playing 变化立即重跑）
      * - 播完最后一首且不循环 → 立刻让位：已经没有"待续"了，留着只是挡住天气
      *   （单曲/列表循环时 queueExhausted 为 false —— 那只是这一首结束，歌还会继续）
-     * - 暂停 → 给 [NOW_PLAYING_PAUSE_YIELD_MS] 的缓冲再让位：
-     *   随手暂停几秒又继续很常见，立刻让位会让标题栏来回跳版式
+     * - 暂停 → 给 [NOW_PLAYING_PAUSE_YIELD_MS]（**60s**）的缓冲再让位：
+     *   随手暂停几秒又继续很常见，立刻让位会让标题栏来回跳版式。
+     *   2026-11-15 由 30s 放宽到 60s（用户要求"暂停 1 分钟再切回天气"）
      */
     LaunchedEffect(hasContent, playing, ended, queueExhausted) {
         if (!hasContent) {
@@ -934,7 +935,7 @@ private const val CHIP_MOTION_MS = 220
  * 30s：短到不会长期挡着天气，长到足以覆盖"暂停一下接个话又继续"这种常见动作 ——
  * 立刻让位会让标题栏在几秒内来回换两次版式。
  */
-private const val NOW_PLAYING_PAUSE_YIELD_MS = 30_000L
+private const val NOW_PLAYING_PAUSE_YIELD_MS = 60_000L
 /** 歌词与上方"歌手"之间的间隔：把"唱到哪了"与"这是什么歌"隔开一档。 */
 private val CHIP_LYRIC_GAP = 3.dp
 

@@ -613,6 +613,7 @@ fun UnifiedUpdateDialog(
     onDismiss: () -> Unit,
     onDownloadApp: () -> Unit,
     onInstallApp: () -> Unit,
+    onCancelDownload: () -> Unit,
     onCoreUpdateConfirmed: () -> Unit
 ) {
     val palette = LocalResolvedPalette.current
@@ -620,6 +621,15 @@ fun UnifiedUpdateDialog(
     // 再开一个就又是一层独立平台 Window，等于把刚消掉的叠加问题重新引回来。
     var coreConfirming by remember { mutableStateOf(false) }
     LaunchedEffect(state.visible) { if (!state.visible) coreConfirming = false }
+    /*
+     * App 包正在下载（2026-11-15 用户要求）。
+     *
+     * 这一态下：
+     * · 内容区的更新日志整块让位给圆环 —— 日志已经看过一次，下载中再堆在环上方，
+     *   用户会以为"没开始"；
+     * · 底部按钮从单颗「稍后」变成「左取消 / 右后台进行」。
+     */
+    val appDownloading = state.showAppSection && state.app.state == "downloading"
 
     UfiScrollableDialog(
         visible = state.visible,
@@ -646,6 +656,9 @@ fun UnifiedUpdateDialog(
         confirmButton = {
             val close = LocalUfiDialogClose.current
             when {
+                // App 包下载中：右侧是「后台进行」—— 关掉弹窗、下载继续
+                // （与「取消」成对：一个只是收起界面，一个是真的停掉任务）
+                appDownloading -> UfiButton(text = "后台进行", onClick = { close(onDismiss) })
                 coreConfirming -> UfiButton(
                     text = "确认更新 Core",
                     onClick = {
@@ -664,8 +677,16 @@ fun UnifiedUpdateDialog(
             val close = LocalUfiDialogClose.current
             UfiButton(
                 variant = UfiButtonVariant.Secondary,
-                text = if (state.hasAnyUpdate) "稍后" else "关闭",
-                onClick = { close(onDismiss) }
+                // 下载中左键是「取消」：它会真的停掉下载任务（2026-11-15 用户要求）
+                text = when {
+                    appDownloading -> "取消"
+                    state.hasAnyUpdate -> "稍后"
+                    else -> "关闭"
+                },
+                onClick = {
+                    if (appDownloading) onCancelDownload()
+                    close(onDismiss)
+                }
             )
         }
     ) {
@@ -683,7 +704,8 @@ fun UnifiedUpdateDialog(
                     name = "UFI-AXIS App（手机端）",
                     currentVersion = state.app.currentVersion,
                     latestVersion = state.app.latestVersion,
-                    changelog = state.app.changelog
+                    changelog = state.app.changelog,
+                    showChangelog = !appDownloading
                 ) {
                     AppUpdateProgressOnly(state = state.app)
                 }
@@ -713,6 +735,7 @@ private fun UpdateTargetBlock(
     currentVersion: String,
     latestVersion: String,
     changelog: String,
+    showChangelog: Boolean = true,
     content: @Composable () -> Unit
 ) {
     val palette = LocalResolvedPalette.current
@@ -729,7 +752,8 @@ private fun UpdateTargetBlock(
         // 2026-10-12（用户要求）：删除「展开更新日志」。原来折叠到3 行 + 一个展开按钮，
         // 而外层是 [UfiScrollableDialog]—— 弹窗本身就滚，长日志天然可以滚着看，
         // 再套一层折叠/展开按钮只是多一次点击，还让用户以为下面被截断了什么。
-        if (changelog.isNotBlank()) {
+        // 下载开始后日志让位给进度环（见 UnifiedUpdateDialog 的 appDownloading）
+        if (showChangelog && changelog.isNotBlank()) {
             Spacer(Modifier.height(Spacing.Small))
             Text(
                 text = changelog.trim(),

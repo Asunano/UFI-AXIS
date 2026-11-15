@@ -938,11 +938,31 @@ fun MediaAudioPlayerScreen(
                          * 居中的前提是该组高度为**定值**：封面 260dp、歌名
                          * minLines = maxLines = 2、歌手行恒定渲染。
                          */
-                        Column(
+                        /*
+                         * 等比缩放（2026-11-15）：这一页原本是"封面 260dp + 歌名 + 歌手 + 三行歌词"
+                         * 的定值版式，屏幕矮（或字体放大）时最下面的歌词会被直接裁掉 ——
+                         * 用户看到的是"封面底下的歌词被挡住"。
+                         *
+                         * 做法：按可用高度算一个比例，整页内容一起缩放。取 0.72 为下限 ——
+                         * 再小文字就不可读了（这时候应该滚动而不是继续缩）。
+                         * 缩放走 `graphicsLayer`：布局尺寸不变（居中的基准仍是整页），
+                         * 命中测试由 Compose 自动做逆变换，按钮照旧可点。
+                         */
+                        // 有没有歌词决定这一页需要多高（见 audioCoverPageScale 的入参说明）
+                        val hasLyricsPreview = lyrics.isNotEmpty() && lyrics.first().timeMs >= 0L
+                        BoxWithConstraints(
                             modifier = Modifier
                                 .fillMaxSize()
-                                // 翻页过渡：与歌词页共用同一套（见 [ufiPageSwitchEffect]）
-                                .ufiPageSwitchEffect(pagerState, page),
+                                .ufiPageSwitchEffect(pagerState, page)
+                        ) {
+                            val pageScale = audioCoverPageScale(maxHeight, hasLyricsPreview)
+                            Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .graphicsLayer {
+                                    scaleX = pageScale
+                                    scaleY = pageScale
+                                },
                             horizontalAlignment = Alignment.CenterHorizontally,
                             // 见 [AudioCoverPageArrangement]：组居中、歌词挂在组下方，两者互不牵动
                             verticalArrangement = AUDIO_COVER_PAGE_ARRANGEMENT
@@ -1266,9 +1286,8 @@ fun MediaAudioPlayerScreen(
                                     )
                                 }
                             }
+                            }
                         }
-
-
                     }
                 }
 
@@ -2194,6 +2213,44 @@ private class AudioCoverPageArrangement(private val groupChildCount: Int) : Arra
  * 摆到组的下方。
  */
 private const val AUDIO_COVER_PAGE_GROUP_CHILDREN = 5
+
+/**
+ * 封面页的等比缩放比例（2026-11-15）。
+ *
+ * 版式是定值的：封面 260dp + 歌名两行 + 歌手行 + 三行歌词预览。屏幕矮或系统字体放大时，
+ * 最下面的歌词会被裁掉（用户报的"封面底下的歌词被遮挡"）。
+ *
+ * 判据取**可用高度**而不是屏幕高度：这一页在 Pager 里，可用高度已经扣掉了标题栏、
+ * Tab、进度条与两排控件 —— 那些才是真正吃掉高度的地方。
+ *
+ * 参考高度 [AUDIO_COVER_PAGE_DESIGN_HEIGHT] 是该版式舒展开所需的高度；低于它按比例缩，
+ * 但不低于 [AUDIO_COVER_PAGE_MIN_SCALE]（再小文字不可读，那时应该让内容滚动，而不是继续缩）。
+ */
+private fun audioCoverPageScale(availableHeight: Dp, hasLyrics: Boolean): Float {
+    if (availableHeight <= 0.dp) return 1f
+    // 两档基准：有歌词要多留三行预览的高度，不能拿同一个数去缩无歌词的页面
+    // （否则正常手机上无歌词也会被白缩 8%）。
+    val design = if (hasLyrics) AUDIO_COVER_PAGE_DESIGN_HEIGHT_WITH_LYRICS else AUDIO_COVER_PAGE_DESIGN_HEIGHT
+    // 多留 8dp 余量：版式里的间距是四舍五入到像素的，正好卡满时会差一两像素而触发裁剪
+    val ratio = availableHeight / (design + 8.dp)
+    return ratio.coerceIn(AUDIO_COVER_PAGE_MIN_SCALE, 1f)
+}
+
+/** 封面页版式舒展开所需的可用高度。 */
+private val AUDIO_COVER_PAGE_DESIGN_HEIGHT = 380.dp
+
+/** 带三行歌词预览时的所需高度（封面 260 + 歌名两行 + 歌手 + 间距 + 三行歌词）。 */
+private val AUDIO_COVER_PAGE_DESIGN_HEIGHT_WITH_LYRICS = 450.dp
+
+/**
+ * 缩放下限。
+ *
+ * 2026-11-15 由 0.72 放到 0.62：实测 360×800dp 的手机上，Pager 可用高度只有约 300dp，
+ * 而带歌词的版式要 450dp —— 0.72 的下限意味着至少要 324dp 才不被裁，于是"带歌词"这一档
+ * 在小屏上依旧被裁（用户反馈"封面模式的歌词区域还是被截断"）。
+ * 0.62 能覆盖到 280dp 左右的可用高度；再小的屏幕本来就该滚动，而不是继续缩。
+ */
+private const val AUDIO_COVER_PAGE_MIN_SCALE = 0.62f
 
 /** 封面页的排布规则实例（无状态，共用一个即可）。 */
 private val AUDIO_COVER_PAGE_ARRANGEMENT =

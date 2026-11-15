@@ -471,6 +471,7 @@ class MainActivity : ComponentActivity() {
                         onDismiss = { viewModel.updatePrompt.dismiss() },
                         onDownloadApp = { viewModel.tools.downloadFrontendApk() },
                         onInstallApp = { viewModel.tools.installFrontendApk() },
+                        onCancelDownload = { viewModel.tools.cancelFrontendDownload() },
                         onCoreUpdateConfirmed = {
                             // 先标记再发请求：标记后 coreStatus 才会被认作"core 自更新进度"
                             // （updateDeviceState 也被手动推送 APK 链路复用）。

@@ -1,4 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  晴间多云里那个"太阳"（圆盘 + 光芒）。
+  与云拆开：光芒慢慢转，云慢慢漂，两者互不牵动。
+  24×24 / stroke 2 / 圆头圆角，与 Tabler 天气图标同一套几何（原图见 docs/mockups/tabler-weather/）。
+-->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp"
     android:height="24dp"
@@ -10,12 +15,12 @@
         android:strokeWidth="2"
         android:strokeLineCap="round"
         android:strokeLineJoin="round"
-        android:pathData="M7 18a4.6 4.4 0 0 1 0 -9a5 4.5 0 0 1 11 2h1a3.5 3.5 0 0 1 0 7" />
+        android:pathData="M8 12a4 4 0 1 0 8 0a4 4 0 1 0 -8 0" />
     <path
         android:fillColor="@android:color/transparent"
         android:strokeColor="#FFFFFFFF"
         android:strokeWidth="2"
         android:strokeLineCap="round"
         android:strokeLineJoin="round"
-        android:pathData="M11 15v.01m0 3v.01m0 3v.01m4 -4v.01m0 3v.01" />
+        android:pathData="M3 12h1m8 -9v1m8 8h1m-9 8v1m-6.4 -15.4l.7 .7m12.1 -.7l-.7 .7m0 11.4l.7 .7m-12.1 -.7l-.7 .7" />
 </vector>

@@ -151,8 +151,25 @@ internal fun MediaLyricsPreview(
      * 一路刷下来"，而这一刻的真实语义是"这首歌已经唱到第 N 句了"。所以第一次直接落位。
      * 之后的换句仍然走动画 —— 整行竖向滚动是这一栏的常态反馈。
      */
+    /*
+     * 只在「确实有当前句」时滚动（2026-11-15）。
+     *
+     * `current` 是 `coerceAtLeast(0)` 的结果，`index == -1`（还没算出当前句：刚开始播、
+     * 暂停后位置回读、或换歌瞬间）时它等于 0 —— 于是列表被**滚到第一句**。
+     * 用户看到的就是"歌词突然跳回最顶部"，等 ticker 算出真实句号又滚回来。
+     * 那一小段时间里应当保持原地不动，而不是先跳到 0 再跳回。
+     */
     val firstFix = remember { mutableStateOf(true) }
-    LaunchedEffect(current) {
+    LaunchedEffect(current, index) {
+        if (index < 0) return@LaunchedEffect
+        /*
+         * 跟手面板正在被拖动时也不滚（2026-11-15）。
+         *
+         * 拖动期间面板每帧改 offset，这一页会被反复测量；每次测量后 LazyColumn 都要重新
+         * 摆放，滚动动画与测量互相打断 —— 表现就是"拖一下歌词就回顶"。
+         * 松手、面板落定后再按当前句对齐一次即可。
+         */
+        if (UfiAudioRisePanel.offsetPx > 0f) return@LaunchedEffect
         if (firstFix.value) {
             firstFix.value = false
             listState.scrollToItem(current, 0)
@@ -172,6 +189,8 @@ internal fun MediaLyricsPreview(
             if (scrolling) return@collect
             delay(LYRIC_RESUME_AFTER_SCROLL_MS)
             if (listState.isScrollInProgress) return@collect
+            if (index < 0) return@collect
+            if (UfiAudioRisePanel.offsetPx > 0f) return@collect
             val visible = listState.layoutInfo.visibleItemsInfo.any { it.index == current }
             if (!visible) listState.animateScrollToItem(current, 0)
         }

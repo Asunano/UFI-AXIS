@@ -251,6 +251,8 @@ fun AppearanceSettingsScreen(
                                 options = (ThemeManager.UI_SCALE_PERCENT_MIN..
                                     ThemeManager.UI_SCALE_PERCENT_MAX step 5).toList(),
                                 onValueSelected = { themeManager.setUiScalePercent(it) },
+                                // 固定宽度保留：`UfiDropdown` 现在会撑满"被钉死"的宽度
+                                // （见其内部 `widthPinned` 判定），不会再在右侧留空洞。
                                 modifier = Modifier.width(110.dp),
                                 unitSuffix = "%"
                             )

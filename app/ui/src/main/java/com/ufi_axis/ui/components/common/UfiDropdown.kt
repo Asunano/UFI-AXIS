@@ -218,6 +218,19 @@ fun <T> UfiDropdown(
             if (LocalUfiDropdownInline.current) Modifier.requiredWidthIn(max = 200.dp) else Modifier
         )
     ) {
+        /*
+         * ★ 2026-11-15：**调用方把宽度钉死时（`Modifier.width(110.dp)`），触发器要撑满这个宽度。**
+         *
+         * 原来只有 `fillWidth = true`（弹窗 inline 模式）才 `fillMaxWidth`，其余一律
+         * `wrapContentWidth`。于是「固定宽度 + 内容更窄」的调用点会得到：
+         * 外框 110dp、Surface 只占左边一截，**右侧留一个空洞** ——
+         * 表现就是"下拉框没有靠右边框对齐"（外观页、数据采集页、几乎所有设置行都有）。
+         *
+         * 逐个调用点删宽度治不了本（还把各行宽度搞得参差不齐），所以在这里统一：
+         * 父约束"宽度已固定"（min == max）⇒ 当成 fill，箭头也随之被推到右边缘。
+         */
+        val widthPinned = constraints.hasFixedWidth
+        val shouldFill = fillWidth || widthPinned
         val triggerWidth = if (triggerWidthPx > 0) with(density) { triggerWidthPx.toDp() } else maxWidth
         val gapPx = with(density) { Spacing.Small.roundToPx() }
         val edgeMarginPx = with(density) { Spacing.Large.roundToPx() }
@@ -239,7 +252,7 @@ fun <T> UfiDropdown(
         // 锚点其实是外层字段（可能比触发器宽），菜单会从触发器右侧多出一截。
         Box(
             modifier = Modifier.then(
-                if (fillWidth) Modifier.fillMaxWidth() else Modifier.wrapContentWidth()
+                if (shouldFill) Modifier.fillMaxWidth() else Modifier.wrapContentWidth()
             )
         ) {
         Surface(
@@ -253,7 +266,7 @@ fun <T> UfiDropdown(
             // （「2」/「chip1」）点起来费劲，也容不下下箭头。宽度由「文字 + 单位 + 箭头 + 内距」
             // 自然决定，长选项（密码档位长文案）也据此展开，不再固定成整行宽。
             modifier = Modifier
-                .then(if (fillWidth) Modifier.fillMaxWidth() else Modifier.wrapContentWidth())
+                .then(if (shouldFill) Modifier.fillMaxWidth() else Modifier.wrapContentWidth())
                 .widthIn(min = UfiDropdownTriggerMinWidth)
                 // 最小高度而不是固定高度：字号调大时触发器跟着长（见常量说明）
                 .heightIn(min = UfiDropdownTriggerHeight)
@@ -263,7 +276,7 @@ fun <T> UfiDropdown(
         ) {
             Row(
                 modifier = Modifier
-                    .then(if (fillWidth) Modifier.fillMaxWidth() else Modifier.wrapContentWidth())
+                    .then(if (shouldFill) Modifier.fillMaxWidth() else Modifier.wrapContentWidth())
                     .widthIn(min = UfiDropdownTriggerMinWidth)
                     .padding(horizontal = UfiDropdownPaddingH),
                 verticalAlignment = Alignment.CenterVertically
@@ -289,12 +302,10 @@ fun <T> UfiDropdown(
                     )
                 }
                 // 2026-10-19：**无条件**把箭头推到右边缘。
-                // 原来只在 fillWidth 时加 weight：固定宽度用法（如「界面缩放」的 110dp 触发器）
-                // 内容比盒子窄，箭头紧跟文字 → 右侧空出一截，看起来"没靠右"。
-                // 在 wrapContentWidth 下 weight 拿不到剩余空间，等于无操作，不影响既有布局。
-                // 2026-10-24：只在 fillWidth 时推箭头 —— wrapContentWidth 下 weight 会把 Row 撑到约束上限，
-                // 触发器就会被拉成一条长条（WiFi 弹窗三个下拉的"异常长"正是这个）。
-                if (fillWidth) Spacer(Modifier.weight(1f))
+                // 只在"撑满"时把箭头推到右边缘：fillWidth（弹窗 inline）或宽度被调用方钉死。
+                // 2026-10-24 的教训仍在：wrapContentWidth 下 weight 会把 Row 撑到约束上限，
+                // 触发器会被拉成一条长条（WiFi 弹窗三个下拉的"异常长"正是这个），所以不能用无条件的 weight。
+                if (shouldFill) Spacer(Modifier.weight(1f))
             Icon(
                     Icons.Filled.KeyboardArrowDown,
                     contentDescription = null,

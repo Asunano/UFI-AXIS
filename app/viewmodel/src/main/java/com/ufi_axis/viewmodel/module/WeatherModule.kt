@@ -8,6 +8,8 @@ import com.ufi_axis.data.model.WeatherNowResponse
 import com.ufi_axis.util.DebugLog
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -39,6 +41,21 @@ data class WeatherState(
         get() = config.enabled && now?.configured == true
 }
 
+/**
+ * 取数失败后的重试退避（2026-11-15 用户要求）。
+ *
+ * 之前失败一次就一直是空白，直到下次冷启动重新 [WeatherModule.loadConfig] ——
+ * 而"冷启动那次恰好失败"正是顶栏天气整块消失的直接原因（实测到 F50 的链路 356ms / 50% 丢包）。
+ *
+ * 三次够用：30s 覆盖瞬时抖动，2min 覆盖一次重连，5min 覆盖"出门一趟"。
+ * 全部用尽就停手 —— 后台不该无限重试。
+ */
+internal val WEATHER_RETRY_DELAYS_MS = longArrayOf(30_000L, 120_000L, 300_000L)
+
+/** 第 [attempt] 次重试前该等多久；已用尽返回 null（不再重试）。 */
+internal fun weatherRetryDelayMs(attempt: Int): Long? =
+    WEATHER_RETRY_DELAYS_MS.getOrNull(attempt)
+
 class WeatherModule(
     private val api: UfiAxisApi,
     private val scope: CoroutineScope,
@@ -53,12 +70,44 @@ class WeatherModule(
     private val _state = MutableStateFlow(WeatherState())
     val state: StateFlow<WeatherState> = _state.asStateFlow()
 
+    /** 失败重试的协程与已用次数（成功即清零）。 */
+    private var retryJob: Job? = null
+    private var retryAttempt = 0
+
+    /**
+     * 排一次重试。
+     *
+     * @param what 失败的是哪一步（`config` / `now`），只用于日志。
+     */
+    private suspend fun scheduleRetry(what: String) {
+        val delayMs = weatherRetryDelayMs(retryAttempt) ?: return
+        retryAttempt++
+        // 只取消**别人**排的那次：重试任务自己失败时不能把自己 cancel 掉，
+        // 否则这条重试链在第一次失败后就断了（attempt 用尽前它应当继续往后排）。
+        val self = kotlinx.coroutines.currentCoroutineContext()[Job]
+        if (retryJob != null && retryJob !== self) retryJob?.cancel()
+        DebugLog.i(TAG, "天气${what}取数失败，${delayMs}ms 后第 $retryAttempt 次重试")
+        retryJob = scope.launch {
+            delay(delayMs)
+            // 配置和数据一起补：两条链路可能各自失败过
+            loadConfig()
+        }
+    }
+
+    /** 成功一次就把退避清零，避免"偶发失败"累积成不再重试。 */
+    private fun cancelRetry() {
+        retryJob?.cancel()
+        retryJob = null
+        retryAttempt = 0
+    }
+
     /** 读配置。设置页进入、以及 app 启动时各一次。 */
     fun loadConfig() {
         scope.launch {
             try {
                 val cfg = api.getWeatherConfig()
                 _state.update { it.copy(config = cfg, configLoaded = true, errorMessage = null) }
+                cancelRetry()
                 // 开着就顺手取一次数据，否则标题栏会空一拍
                 if (cfg.enabled) refresh()
             } catch (e: CancellationException) {
@@ -66,6 +115,7 @@ class WeatherModule(
             } catch (e: Exception) {
                 DebugLog.w(TAG, "读取天气配置失败: ${e.message}")
                 _state.update { it.copy(configLoaded = true, errorMessage = "读取天气配置失败: ${e.message}") }
+                scheduleRetry("config")
             }
         }
     }
@@ -87,6 +137,7 @@ class WeatherModule(
             _state.update { it.copy(loading = true) }
             try {
                 val now = api.getWeatherNow()
+                cancelRetry()
                 _state.update {
                     it.copy(
                         now = now,
@@ -102,6 +153,7 @@ class WeatherModule(
                 DebugLog.w(TAG, "读取天气失败: ${e.message}")
                 // 失败保留上一次的数据：标题栏上一格旧温度比空白有用
                 _state.update { it.copy(loading = false, errorMessage = "读取天气失败: ${e.message}") }
+                scheduleRetry("now")
             }
         }
     }

@@ -1169,10 +1169,31 @@ class ToolsModule(
      * filesDir/update/app-update.apk（.part 原子提交）→ SHA-256 校验（与清单 apkSha256 比对，不符置 error）。
      * 缓存复用：目标文件已存在且 SHA-256 与清单一致 → 跳过下载直接进入 downloaded 状态。
      */
+    /** App 更新包的下载任务句柄（供「取消」用）。 */
+    private var frontendDownloadJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * 取消正在进行的 App 更新包下载。
+     *
+     * 只在「下载中」有意义：任务被取消后状态回到 `available`，用户可以重新开始。
+     * 已写了一半的 `.part` 文件由下一次下载清理（见 [downloadFrontendApk] 开头的 `partFile.delete()`）。
+     */
+    fun cancelFrontendDownload() {
+        frontendDownloadJob?.cancel()
+        frontendDownloadJob = null
+        if (_frontendUpdateState.value.state == "downloading") {
+            _frontendUpdateState.value = _frontendUpdateState.value.copy(
+                state = "available", downloadProgress = 0, errorMessage = null
+            )
+        }
+    }
+
     fun downloadFrontendApk() {
         val current = _frontendUpdateState.value
         if (current.latestVersion.isBlank()) return
-        scope.launch {
+        // 记句柄：弹窗里的「取消」要能真的停掉下载（2026-11-15）
+        frontendDownloadJob?.cancel()
+        frontendDownloadJob = scope.launch {
             _frontendUpdateState.value = _frontendUpdateState.value.copy(
                 state = "downloading", downloadProgress = 0, errorMessage = null
             )
@@ -1209,6 +1230,12 @@ class ToolsModule(
                     state = "downloaded", downloadProgress = 100,
                     downloadedApkPath = targetFile.absolutePath
                 )
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // 用户点了「取消」：回到可下载态，不当成失败
+                _frontendUpdateState.value = _frontendUpdateState.value.copy(
+                    state = "available", downloadProgress = 0, errorMessage = null
+                )
+                throw e
             } catch (e: Exception) {
                 _frontendUpdateState.value = _frontendUpdateState.value.copy(
                     state = "error", errorMessage = "下载失败: ${e.message}"
