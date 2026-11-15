@@ -2,32 +2,32 @@
   "frontend": {
     "version": "0.1.3",
     "versionCode": 8,
-    "apkUrl": "",
-    "apkSha256": "",
+    "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.1.3/UFI-AXIS-app-0.1.3.apk",
+    "apkSha256": "02a4da2b60834efc407f013a8cd4fd1dce0b5b3fe8b914323824f83ed70c8b70",
     "changelog": "App 端更新：\n- 新增：core 更新可以取消（下载/校验阶段真正停下；安装开始后会明确提示不可取消）\n- 改进：core 更新弹窗与 App 段统一 —— 进行中只显示进度圆环，底部「取消 / 后台进行」\n- 修复：App 与 Core 同时有更新时，两个弹窗会叠在一起导致背景异常（现在严格串行）",
-    "apkSize": 0,
-    "publishedAt": "",
-    "tagName": ""
+    "apkSize": 9909456,
+    "publishedAt": "2026-11-15T07:35:10Z",
+    "tagName": "v0.1.3"
   },
   "backend": {
     "version": "0.1.3",
     "versionCode": 8,
-    "apkUrl": "",
-    "apkSha256": "",
+    "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.1.3/UFI-AXIS-core-0.1.3.apk",
+    "apkSha256": "929e645ad9eed34fb3d9a85e310023ec817924385aae4333f3f6524b70c038b0",
     "changelog": "Core 端更新：\n- 新增 POST /api/update/cancel：取消正在进行的自动更新（仅下载/校验阶段，安装开始后拒绝）\n- 修复：此前取消只清状态、下载协程仍在跑；现在会真正中断并清理半包\nWeb 端：无功能改动",
-    "apkSize": 0,
-    "publishedAt": "",
-    "tagName": ""
+    "apkSize": 25902173,
+    "publishedAt": "2026-11-15T07:35:10Z",
+    "tagName": "v0.1.3"
   },
   "web": {
     "version": "0.1.3",
     "versionCode": 8,
-    "apkUrl": "",
-    "apkSha256": "",
+    "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.1.3/web-update-0.1.3.zip",
+    "apkSha256": "3dc7aa3d9d8d037822c0b802134ed7fba2c4e096a4c55cc80fb1d3862e24c4bf",
     "changelog": "随 Core 端一同发布。\n本轮 Web 前端无功能改动。",
-    "apkSize": 0,
-    "publishedAt": "",
-    "tagName": ""
+    "apkSize": 2060421,
+    "publishedAt": "2026-11-15T07:35:10Z",
+    "tagName": "v0.1.3"
   },
   "components": {
     "frpc": {
