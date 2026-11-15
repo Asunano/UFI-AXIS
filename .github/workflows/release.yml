@@ -385,8 +385,10 @@ jobs:
           # web.* 每次都被跳过：0.1.1 的清单里 web.apkUrl 为空，独立更新通道拿不到包。
           if [ "$HIGHEST_WEB" = "$WEB_VERSION" ]; then
             FILTER="$FILTER | .web.apkUrl = \$wapk | .web.apkSize = \$wsize | .web.apkSha256 = \$wsha | .web.publishedAt = \$wpub | .web.tagName = \$wtag"
+            WROTE_WEB=1
             echo "web.* 回写：本次 $WEB_VERSION > 基线 $BASE_WEB（main=$MAIN_WEB / 清单=$CUR_WEB）"
           else
+            WROTE_WEB=0
             echo "::notice::跳过 web.* 回写：本次 web 包版本 $WEB_VERSION 不高于已发布基线 $BASE_WEB（main=$MAIN_WEB / 清单=$CUR_WEB）。保留清单里那条更新的 web 记录。"
           fi
           jq \
@@ -409,6 +411,45 @@ jobs:
             version.json > version.json.tmp && mv version.json.tmp version.json
           echo "version.json 回写后："
           cat version.json
+
+          # ── 回写自检（2026-11-15）──
+          # v0.1.1 的教训：守卫条件写错导致 web.* 被静默跳过，清单里 apkUrl 为空，
+          # 而流水线一路"成功"。这里把"写进去的哈希 == 实际产物的哈希"变成硬断言，
+          # 且**放在 commit 之前** —— 坏清单不允许进 main。
+          verify_sha() {
+            local name="$1" file="$2" jqpath="$3"
+            local want actual
+            want=$(jq -r "$jqpath" version.json)
+            if [ -z "$want" ] || [ "$want" = "null" ]; then
+              echo "::error::$name：$jqpath 为空"
+              return 1
+            fi
+            actual=$(sha256sum "$file" | awk '{print $1}')
+            if [ "$want" != "$actual" ]; then
+              echo "::error::$name：$jqpath 不一致（清单 $want / 实际 $actual）"
+              return 1
+            fi
+            echo "✓ $name sha256 一致"
+          }
+          FAILED=0
+          verify_sha app "$APP_APK" .frontend.apkSha256 || FAILED=1
+          verify_sha core "$CORE_APK" .backend.apkSha256 || FAILED=1
+          if [ "$WROTE_WEB" = "1" ]; then
+            verify_sha web "$WEB_ZIP" .web.apkSha256 || FAILED=1
+            case "$(jq -r .web.apkUrl version.json)" in
+              *"/$WEB_NAME") echo "✓ web.apkUrl 指向本次产物 $WEB_NAME" ;;
+              *) echo "::error::web.apkUrl 未指向本次产物（$WEB_NAME）"; FAILED=1 ;;
+            esac
+          fi
+          # 双端的直链也必须指向本次实际文件名，否则用户点到 404
+          for pair in "frontend:$APP_NAME" "backend:$CORE_NAME"; do
+            key="${pair%%:*}"; want_name="${pair#*:}"
+            case "$(jq -r ".$key.apkUrl" version.json)" in
+              *"/$want_name") echo "✓ $key.apkUrl 指向本次产物 $want_name" ;;
+              *) echo "::error::$key.apkUrl 未指向本次产物（$want_name）"; FAILED=1 ;;
+            esac
+          done
+          [ "$FAILED" = "0" ] || { echo "::error::version.json 回写自检失败，中止（不提交、不发布）"; exit 1; }
           # 仓库只允许 Asunano 作为提交作者（2026-11-09），不要改回 bot 身份
           git config user.name "Asunano"
           git config user.email "3233353454@qq.com"
