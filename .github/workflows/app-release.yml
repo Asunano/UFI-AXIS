@@ -1,0 +1,183 @@
+# =============================================================================
+# UFI-AXIS App 独立发布工作流（2026-11-15 新建）
+# =============================================================================
+# 用途：**只改手机端 App、不动设备端 core** 的更新。
+#
+# 与 web-release.yml 同构，只是构建对象换成 `:app`，回写 version.json 的 `frontend` 对象。
+#
+# ── 触发与版本号 ──────────────────────────────────────────────────────────────
+#   · 触发：打 `app-v<version>` 标签。
+#   · 版本号：`frontend.version` 独立递增，与 backend.version 解耦
+#     （设备端 core 用 backend.version，App 用 frontend.version，两者本来就可以不同步）。
+#     发版流程 = 先改根 version.json 的 frontend.version(+versionCode) → 提交 →
+#     打 `app-v<同值>` 标签。下面「Verify tag matches version.json」会强制一致。
+#   · `app-v*` 不会误触发 release.yml（它的过滤是 `tags: ['v*']`）。
+#
+# ── 更新通道 ──────────────────────────────────────────────────────────────────
+#   App 自己读仓库根 version.json 的 frontend 对象（直连/镜像由设备侧 MirrorResolver 决定），
+#   比对 versionName + versionCode 后从 `frontend.apkUrl` 下载。所以本工作流只需
+#   把 frontend.* 回写进 main 的 version.json。
+# =============================================================================
+
+name: Release App (standalone)
+
+on:
+  push:
+    tags:
+      - 'app-v*'
+
+permissions:
+  contents: write
+
+# ⚠ 必须与 release.yml / web-release.yml / core-release.yml 共用同一个组：
+#   它们都会 commit 根目录 version.json，并发跑会撞 non-fast-forward。
+concurrency:
+  group: version-json
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build & Publish App APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Guard — tracked text files must be UTF-8
+        run: |
+          bad=$(git ls-files '*.kt' '*.kts' '*.java' '*.aidl' '*.pro' '*.keep' \
+                  '*.ts' '*.vue' '*.mjs' '*.js' '*.json' '*.css' '*.html' '*.svg' \
+                  '*.xml' '*.md' '*.yml' '*.yaml' '*.toml' '*.properties' '*.py' '*.sh' \
+                | while read -r f; do
+                    iconv -f UTF-8 -t UTF-8 "$f" >/dev/null 2>&1 || echo "$f"
+                  done)
+          if [ -n "$bad" ]; then
+            echo "::error::以下跟踪文件不是 UTF-8，请转码后再提交："
+            echo "$bad"
+            exit 1
+          fi
+          echo "OK: 跟踪的文本文件均为 UTF-8"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Gradle (dependency & build cache)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+          # sign-android-release 硬编码使用 build-tools 29.0.3 的 zipalign
+          sdkmanager "build-tools;29.0.3"
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      # ── 读版本号（单一版本源：仓库根 version.json 的 frontend 对象）──
+      - name: Read version.json
+        id: version
+        run: |
+          FRONTEND_VERSION=$(jq -r '.frontend.version' version.json)
+          FRONTEND_VERSION_CODE=$(jq -r '.frontend.versionCode' version.json)
+          FRONTEND_CHANGELOG=$(jq -r '.frontend.changelog // ""' version.json)
+          echo "FRONTEND_VERSION=$FRONTEND_VERSION" >> $GITHUB_OUTPUT
+          echo "FRONTEND_VERSION_CODE=$FRONTEND_VERSION_CODE" >> $GITHUB_OUTPUT
+          echo "FRONTEND_CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+          echo "$FRONTEND_CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "frontend=$FRONTEND_VERSION/$FRONTEND_VERSION_CODE"
+
+      - name: Verify tag matches version.json
+        run: |
+          VERSION="${{ steps.version.outputs.FRONTEND_VERSION }}"
+          if [ "app-v${VERSION}" != "${{ github.ref_name }}" ]; then
+            echo "::error::标签 ${{ github.ref_name }} 与 version.json frontend.version ($VERSION) 不一致。"
+            echo "::error::请先改根目录 version.json 再打 app-v<版本> 标签。"
+            exit 1
+          fi
+
+      # 发版门禁：全量单测必须绿
+      - name: Run unit tests (release gate)
+        run: ./gradlew testDebugUnitTest :core:contract:test
+
+      # release 变体不挂签名（signingConfigs 的 `ufi` 只服务 benchmark 变体），这里产出未签名 APK
+      - name: Build app release APK (unsigned)
+        run: |
+          ./gradlew :app:assembleRelease \
+            -PufiFrontendVersionName=${{ steps.version.outputs.FRONTEND_VERSION }} \
+            -PufiFrontendVersionCode=${{ steps.version.outputs.FRONTEND_VERSION_CODE }}
+
+      - name: Sign app APK
+        id: sign_app
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: app/build/outputs/apk/release
+          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
+          alias: ${{ secrets.ALIAS }}
+          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Rename signed APK
+        id: rename
+        run: |
+          APP_DIR="$(dirname "${{ steps.sign_app.outputs.signedReleaseFile }}")"
+          APP_NAME="UFI-AXIS-app-${{ steps.version.outputs.FRONTEND_VERSION }}.apk"
+          mv "${{ steps.sign_app.outputs.signedReleaseFile }}" "$APP_DIR/$APP_NAME"
+          echo "app=$APP_DIR/$APP_NAME" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$APP_DIR/$APP_NAME" | awk '{print $1}')   size=$(stat -c %s "$APP_DIR/$APP_NAME")"
+
+      # ── 建 Release（必须先于回写：回写的 apkUrl 指向这个附件）──
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: App ${{ steps.version.outputs.FRONTEND_VERSION }}
+          body: |
+            ## App 独立更新 ${{ steps.version.outputs.FRONTEND_VERSION }}（versionCode ${{ steps.version.outputs.FRONTEND_VERSION_CODE }}）
+
+            本包只更新手机端 App，**不涉及设备端 core**。设备侧由 App 读取本仓库 `main` 分支的
+            `version.json` 自动提示更新。
+
+            ${{ steps.version.outputs.FRONTEND_CHANGELOG }}
+          files: ${{ steps.rename.outputs.app }}
+
+      # ── 回写 version.json 的 frontend 对象（只动这一段）──
+      - name: Write back version.json (frontend only)
+        run: |
+          APP="${{ steps.rename.outputs.app }}"
+          APP_NAME="$(basename "$APP")"
+          APP_SHA="$(sha256sum "$APP" | awk '{print $1}')"
+          APP_SIZE="$(stat -c %s "$APP")"
+          PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          jq \
+            --arg fapk "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$APP_NAME" \
+            --argjson fsize "$APP_SIZE" \
+            --arg fsha "$APP_SHA" \
+            --arg fpub "$PUBLISHED_AT" \
+            --arg ftag "${{ github.ref_name }}" \
+            '.frontend.apkUrl = $fapk | .frontend.apkSize = $fsize | .frontend.apkSha256 = $fsha | .frontend.publishedAt = $fpub | .frontend.tagName = $ftag' \
+            version.json > version.json.tmp && mv version.json.tmp version.json
+          echo "version.json 的 frontend 段回写后："
+          jq .frontend version.json
+          # 仓库只允许 Asunano 作为提交作者（2026-11-09）
+          git config user.name "Asunano"
+          git config user.email "3233353454@qq.com"
+          git add version.json
+          git commit -m "ci: 回写 app release ${{ github.ref_name }} 的 apkUrl/apkSize/apkSha256/publishedAt/tagName" \
+            || echo "version.json 无变更，跳过 commit"
+          # 先 commit 再 rebase：index 有暂存改动时 git rebase 会直接拒绝
+          git fetch origin main || true
+          git rebase origin/main || git rebase --abort || true
+          git push origin HEAD:main || echo "::warning::version.json 回写 push 失败（不阻断 release）"
+
+      - name: Move tag to write-back commit
+        run: |
+          git tag -f "${{ github.ref_name }}" HEAD
+          git push origin "refs/tags/${{ github.ref_name }}" --force

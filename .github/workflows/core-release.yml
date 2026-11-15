@@ -1,0 +1,196 @@
+# =============================================================================
+# UFI-AXIS Core 独立发布工作流（2026-11-15 新建）
+# =============================================================================
+# 用途：**只改设备端 core、不动手机端 App** 的更新。
+#
+# 与 web-release.yml 同构，只是构建对象换成 `:core`，回写 version.json 的 `backend` 对象。
+#
+# ── 触发与版本号 ──────────────────────────────────────────────────────────────
+#   · 触发：打 `core-v<version>` 标签。
+#   · 版本号：`backend.version`，与 frontend.version 解耦。
+#     发版流程 = 先改根 version.json 的 backend.version(+versionCode) → 提交 →
+#     打 `core-v<同值>` 标签。下面「Verify tag matches version.json」会强制一致。
+#   · `core-v*` 不会误触发 release.yml（它的过滤是 `tags: ['v*']`）。
+#
+# ── 更新通道 ──────────────────────────────────────────────────────────────────
+#   core 自己读仓库根 version.json 的 backend 对象（直连/镜像由设备侧 MirrorResolver 决定），
+#   比对 versionName + versionCode 后从 `backend.apkUrl` 下载。所以本工作流只需
+#   把 backend.* 回写进 main 的 version.json。
+#
+#   ⚠ core 构建需要 Web 前端产物（`:core:network:buildWeb` 调 vue-tsc/vite），
+#   全新 checkout 没有 node_modules —— 所以本工作流比 app 版多一段 Node 依赖安装。
+# =============================================================================
+
+name: Release Core (standalone)
+
+on:
+  push:
+    tags:
+      - 'core-v*'
+
+permissions:
+  contents: write
+
+# ⚠ 必须与 release.yml / web-release.yml / core-release.yml 共用同一个组：
+#   它们都会 commit 根目录 version.json，并发跑会撞 non-fast-forward。
+concurrency:
+  group: version-json
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build & Publish Core APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Guard — tracked text files must be UTF-8
+        run: |
+          bad=$(git ls-files '*.kt' '*.kts' '*.java' '*.aidl' '*.pro' '*.keep' \
+                  '*.ts' '*.vue' '*.mjs' '*.js' '*.json' '*.css' '*.html' '*.svg' \
+                  '*.xml' '*.md' '*.yml' '*.yaml' '*.toml' '*.properties' '*.py' '*.sh' \
+                | while read -r f; do
+                    iconv -f UTF-8 -t UTF-8 "$f" >/dev/null 2>&1 || echo "$f"
+                  done)
+          if [ -n "$bad" ]; then
+            echo "::error::以下跟踪文件不是 UTF-8，请转码后再提交："
+            echo "$bad"
+            exit 1
+          fi
+          echo "OK: 跟踪的文本文件均为 UTF-8"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Gradle (dependency & build cache)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+          # sign-android-release 硬编码使用 build-tools 29.0.3 的 zipalign
+          sdkmanager "build-tools;29.0.3"
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      # :core:network:buildWeb 需要 vue-tsc/vite —— 全新 checkout 没有 node_modules
+      - name: Set up Node.js (web build)
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies
+        run: cd web && npm ci
+
+      # ── 读版本号（单一版本源：仓库根 version.json 的 frontend 对象）──
+      - name: Read version.json
+        id: version
+        run: |
+          BACKEND_VERSION=$(jq -r '.backend.version' version.json)
+          BACKEND_VERSION_CODE=$(jq -r '.backend.versionCode' version.json)
+          BACKEND_CHANGELOG=$(jq -r '.backend.changelog // ""' version.json)
+          echo "BACKEND_VERSION=$BACKEND_VERSION" >> $GITHUB_OUTPUT
+          echo "BACKEND_VERSION_CODE=$BACKEND_VERSION_CODE" >> $GITHUB_OUTPUT
+          echo "BACKEND_CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+          echo "$BACKEND_CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "backend=$BACKEND_VERSION/$BACKEND_VERSION_CODE"
+
+      - name: Verify tag matches version.json
+        run: |
+          VERSION="${{ steps.version.outputs.BACKEND_VERSION }}"
+          if [ "core-v${VERSION}" != "${{ github.ref_name }}" ]; then
+            echo "::error::标签 ${{ github.ref_name }} 与 version.json backend.version ($VERSION) 不一致。"
+            echo "::error::请先改根目录 version.json 再打 core-v<版本> 标签。"
+            exit 1
+          fi
+
+      # 发版门禁：全量单测必须绿
+      - name: Run unit tests (release gate)
+        run: ./gradlew testDebugUnitTest :core:contract:test
+
+      # release 变体不挂签名（signingConfigs 的 `ufi` 只服务 benchmark 变体），这里产出未签名 APK
+      - name: Build core release APK (unsigned)
+        run: |
+          ./gradlew :core:assembleRelease \
+            -PufiBackendVersionName=${{ steps.version.outputs.BACKEND_VERSION }} \
+            -PufiBackendVersionCode=${{ steps.version.outputs.BACKEND_VERSION_CODE }}
+
+      - name: Sign core APK
+        id: sign_core
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: core/build/outputs/apk/release
+          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
+          alias: ${{ secrets.ALIAS }}
+          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Rename signed APK
+        id: rename
+        run: |
+          CORE_DIR="$(dirname "${{ steps.sign_core.outputs.signedReleaseFile }}")"
+          CORE_NAME="UFI-AXIS-core-${{ steps.version.outputs.BACKEND_VERSION }}.apk"
+          mv "${{ steps.sign_core.outputs.signedReleaseFile }}" "$CORE_DIR/$CORE_NAME"
+          echo "core=$CORE_DIR/$CORE_NAME" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$CORE_DIR/$CORE_NAME" | awk '{print $1}')   size=$(stat -c %s "$CORE_DIR/$CORE_NAME")"
+
+      # ── 建 Release（必须先于回写：回写的 apkUrl 指向这个附件）──
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Core ${{ steps.version.outputs.BACKEND_VERSION }}
+          body: |
+            ## Core 独立更新 ${{ steps.version.outputs.BACKEND_VERSION }}（versionCode ${{ steps.version.outputs.BACKEND_VERSION_CODE }}）
+
+            本包只更新设备端 core，**不涉及手机端 App**。设备侧由 core 读取本仓库 `main` 分支的
+            `version.json` 自动更新（下载 → SHA-256 校验 → 安装 → 重启服务）。
+
+            ${{ steps.version.outputs.BACKEND_CHANGELOG }}
+          files: ${{ steps.rename.outputs.core }}
+
+      # ── 回写 version.json 的 backend 对象（只动这一段）──
+      - name: Write back version.json (frontend only)
+        run: |
+          CORE="${{ steps.rename.outputs.core }}"
+          CORE_NAME="$(basename "$CORE")"
+          CORE_SHA="$(sha256sum "$CORE" | awk '{print $1}')"
+          CORE_SIZE="$(stat -c %s "$CORE")"
+          PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          jq \
+            --arg bapk "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$CORE_NAME" \
+            --argjson bsize "$CORE_SIZE" \
+            --arg bsha "$CORE_SHA" \
+            --arg bpub "$PUBLISHED_AT" \
+            --arg btag "${{ github.ref_name }}" \
+            '.backend.apkUrl = $bapk | .backend.apkSize = $bsize | .backend.apkSha256 = $bsha | .backend.publishedAt = $bpub | .backend.tagName = $btag' \
+            version.json > version.json.tmp && mv version.json.tmp version.json
+          echo "version.json 的 backend 段回写后："
+          jq .backend version.json
+          # 仓库只允许 Asunano 作为提交作者（2026-11-09）
+          git config user.name "Asunano"
+          git config user.email "3233353454@qq.com"
+          git add version.json
+          git commit -m "ci: 回写 core release ${{ github.ref_name }} 的 apkUrl/apkSize/apkSha256/publishedAt/tagName" \
+            || echo "version.json 无变更，跳过 commit"
+          # 先 commit 再 rebase：index 有暂存改动时 git rebase 会直接拒绝
+          git fetch origin main || true
+          git rebase origin/main || git rebase --abort || true
+          git push origin HEAD:main || echo "::warning::version.json 回写 push 失败（不阻断 release）"
+
+      - name: Move tag to write-back commit
+        run: |
+          git tag -f "${{ github.ref_name }}" HEAD
+          git push origin "refs/tags/${{ github.ref_name }}" --force

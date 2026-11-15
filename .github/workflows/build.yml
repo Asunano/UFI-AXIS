@@ -18,7 +18,10 @@ on:
     # '**' 而非 '*'：GitHub 的分支 glob 里 '*' 不跨 '/'，用 '*' 会漏掉 feat/xxx、fix/xxx 这类
     # 带前缀的分支（CI 静默不触发，版本一致性门禁与 debug 编译一起失效）。
     branches: ['**']
-    tags-ignore: ['v*']
+    # 发布类标签全部跳过：v* 是全量发布，app-v* / core-v* / web-v* 是单端发布，
+    # 它们各有自己的 workflow（release.yml / app-release.yml / core-release.yml / web-release.yml），
+    # 再跑一遍 debug 构建纯属浪费额度。
+    tags-ignore: ['v*', 'app-v*', 'core-v*', 'web-v*']
   pull_request:
 
 jobs:
