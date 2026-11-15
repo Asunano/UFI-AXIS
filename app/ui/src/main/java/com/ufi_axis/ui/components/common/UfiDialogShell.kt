@@ -273,12 +273,38 @@ internal fun UfiDialogShell(
     // DisposableEffect 的崩溃说明）。所以离场是：先跑 ramp，跑完才真正 dismiss / 卸载。
     var mounted by remember { mutableStateOf(visible) }
 
+    /*
+     * 串行闸（2026-11-15）：同一时刻只允许一个弹窗在场。
+     *
+     * 竞态现场：App 与 Core 同时有新版本时，先弹 Core、点「稍后」后 App 的立刻顶上，
+     * 而前一个窗口还在跑离场 ramp —— 两个 Dialog 叠在同一帧，后者的窗口级 backdrop
+     * 写进了正在销毁的窗口，表现就是"第二个弹窗背景是花的"。
+     *
+     * 这里向 [UfiDialogArbiter] 申请独占权：拿不到就不组合自己的内容（窗口都不创建），
+     * 等持有者**完全离场**（下面 DisposableEffect 的 onDispose）后，靠 generation 变更重试。
+     */
+    val dialogToken = remember { Any() }
+    var granted by remember { mutableStateOf(false) }
+    LaunchedEffect(visible, UfiDialogArbiter.generation) {
+        if (visible) {
+            granted = UfiDialogArbiter.tryAcquire(dialogToken)
+        } else if (granted) {
+            granted = false
+            UfiDialogArbiter.release(dialogToken)
+        }
+    }
+    DisposableEffect(dialogToken) {
+        onDispose { UfiDialogArbiter.release(dialogToken) }
+    }
+
     // 2026-10-23：把「有弹窗在场」广播给**窗口级浮层**（底部胶囊栏）。
     // 胶囊是独立窗口，Dialog 的 scrim/背景模糊只作用于 Activity 窗口、压不到它 ——
     // 不广播的话，弹窗打开时底栏仍然亮着盖在弹窗上（用户报的"模糊层级不对"）。
-    DisposableEffect(visible) {
-        if (visible) UfiDialogVisibility.push()
-        onDispose { if (visible) UfiDialogVisibility.pop() }
+    DisposableEffect(visible, granted) {
+        // 只有**真的显示了**才压底栏：排队中的弹窗不该影响窗口级浮层
+        val active = visible && granted
+        if (active) UfiDialogVisibility.push()
+        onDispose { if (active) UfiDialogVisibility.pop() }
     }
 
     /** 正在离场。置位后所有新的关闭请求都被忽略（防连点导致 ramp 被打断重启）。 */
@@ -330,7 +356,7 @@ internal fun UfiDialogShell(
             closing.value = true
         }
     }
-    if (!mounted) return
+    if (!mounted || !granted) return
 
     val palette = LocalResolvedPalette.current
     val cardContainer = containerColorOverride ?: palette.cardBg
