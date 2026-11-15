@@ -776,8 +776,19 @@ fun UfiScreenScaffold(
                         navController != null -> {
                             {
                                 if (navController.previousBackStackEntry != null) {
+                                    // popBackStack() 返回 Boolean；显式丢弃，避免 lambda 推断成 Any
                                     navController.popBackStack()
+                                } else {
+                                    // 走到这里说明"页面上有返回箭头，但返回栈里已经没有上一页"。
+                                    // 正常不该发生（二级页必然是 push 上来的）；真发生时按钮是死的，
+                                    // 用户只会说"返回键没反应"，而我们没有任何线索。留一条 WARN。
+                                    com.ufi_axis.util.DebugLog.w(
+                                        "Nav",
+                                        "顶栏返回无效：previousBackStackEntry=null " +
+                                            "route=${navController.currentDestination?.route} title=$title"
+                                    )
                                 }
+                                Unit
                             }
                         }
                         else -> null

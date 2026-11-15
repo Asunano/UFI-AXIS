@@ -1076,6 +1076,9 @@ fun MainNavGraph(
                             // 只排一次：转场途中连按十下也只补一级，避免把栈退穿。
                             // （用户想退两级时，第二下需要等动画结束再按 —— 手感代价换稳定性。）
                             backBurstGuard.pendingBack = true
+                            // 记下"吞它的时候人在哪一页"，补发前要比对（见 pendingRoute 的说明）。
+                            backBurstGuard.pendingRoute = navController.currentDestination?.route
+                            backBurstGuard.pendingSinceMs = SystemClock.uptimeMillis()
                         }
                     }
                     activity.onBackPressedDispatcher.addCallback(activity, callback)
@@ -1098,12 +1101,28 @@ fun MainNavGraph(
                     val now = SystemClock.uptimeMillis()
                     val busy = com.ufi_axis_core.util.UiFrameGate.isBusy
                     val remain = backBurstGuard.armedUntilMs - now
-                    val on = busy || remain > 0L
+                    // 只有"还有东西可退"时才启用这道闸：在起始目的地（Tab 宿主）上按返回，
+                    // 用户的意图就是退出 App，此时把返回吞掉再补发一次 `popBackStack()`
+                    // 只会把 MAIN 也退掉（返回栈清空 → 下一次返回直接结束 Activity）。
+                    val hasSomethingToPop =
+                        navController.currentDestination?.route != null &&
+                            navController.currentDestination?.route != Routes.MAIN
+                    val on = (busy || remain > 0L) && hasSomethingToPop
                     backBurstGuard.callback?.isEnabled = on
                     if (!on) {
-                        if (backBurstGuard.pendingBack) {
+                        // 硬上限：帧闸若被泄漏的 `begin()` 卡住，`!on` 永远不成立，
+                        // 被吞下的那次返回就再也没人补发 —— 用户看到的是"返回键完全没反应"。
+                        // 超过 1.5s 就强制走一次补发判定，宁可少吞一次也不让返回死锁。
+                        val stalled =
+                            backBurstGuard.pendingBack &&
+                                now - backBurstGuard.pendingSinceMs > BACK_REPLAY_HARD_CAP_MS
+                        if (backBurstGuard.pendingBack && (!on || stalled)) {
                             backBurstGuard.pendingBack = false
-                            navController.popBackStack()
+                            val swallowedAt = backBurstGuard.pendingRoute
+                            backBurstGuard.pendingRoute = null
+                            if (ufiBackReplayAllowed(swallowedAt, navController.currentDestination?.route)) {
+                                navController.popBackStack()
+                            }
                         }
                         delay(60L)
                     } else {
@@ -1318,6 +1337,18 @@ private class BackBurstGuard {
     /** 被截下来的那一次返回，落定后补发。 */
     var pendingBack: Boolean = false
 
+    /**
+     * 被截下来时所在的目的地路由。
+     *
+     * 补发前要拿它与当前目的地比对：转场窗口内用户很可能又按了一次返回（这一下由 NavHost
+     * 自己处理掉了），此时若仍无条件 `popBackStack()` 就会**多退一层** ——
+     * MAIN 被退掉后返回栈为空，下一次系统返回直接结束 Activity（表现为"按返回直接退出程序"）。
+     */
+    var pendingRoute: String? = null
+
+    /** 吞下这一次返回的时刻；用来给补发加一个硬上限（见使用处的说明）。 */
+    var pendingSinceMs: Long = 0L
+
     /** 守卫保持启用的截止时刻（[SystemClock.uptimeMillis] 口径）；0 = 未上弦。 */
     var armedUntilMs: Long = 0L
 
@@ -1336,3 +1367,20 @@ private class BackBurstGuard {
  * 少吞一次就是闪退。
  */
 private const val BACK_BURST_WINDOW_MS: Long = 500L
+
+/** 补发的硬上限：超过它就不再等帧闸/转场，直接判定一次。 */
+private const val BACK_REPLAY_HARD_CAP_MS: Long = 1_500L
+
+/**
+ * 被吞下的那次返回，现在还能不能补发。
+ *
+ * 只有当人**仍停在**当初被吞的那一页、且那页不是 Tab 宿主时才补发：
+ * 期间若返回已被 NavHost 自己处理过（目的地已经变了），再 `popBackStack()` 就是多退一层 ——
+ * MAIN 被退掉后返回栈为空，再按一次系统返回会**直接结束 Activity**（2026-11-15 复现）。
+ * 在 MAIN 上吞下的返回一律不补发：那里的返回语义就是"退出 App"。
+ */
+internal fun ufiBackReplayAllowed(swallowedRoute: String?, currentRoute: String?): Boolean {
+    if (swallowedRoute == null || currentRoute == null) return false
+    if (swallowedRoute == Routes.MAIN) return false
+    return swallowedRoute == currentRoute
+}
