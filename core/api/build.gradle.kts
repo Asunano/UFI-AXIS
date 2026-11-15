@@ -16,6 +16,8 @@ android {
         // ── 单一版本源（2026-08-10 C2）：version.json → CI -P 注入 / gradle.properties 默认 ──
         // 后端 Core 版本：version.json.backend（与 :core 应用模块 versionName 保持同步）
         buildConfigField("String", "VERSION_NAME", "\"${providers.gradleProperty("ufiBackendVersionName").get()}\"")
+        // 同名重发（版本名不变、只抬内部版本号）要靠它才认得出来，见 UpdateManager 的版本比对
+        buildConfigField("int", "VERSION_CODE", "${providers.gradleProperty("ufiBackendVersionCode").get()}")
     }
     testOptions { unitTests.isIncludeAndroidResources = true }
     buildFeatures {

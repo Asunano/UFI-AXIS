@@ -3,6 +3,7 @@
 package com.ufi_axis_core.api.update
 
 import android.content.pm.PackageManager
+import com.ufi_axis_core.contract.hasUpdate
 import com.ufi_axis_core.lib_api.BuildConfig
 import com.ufi_axis_core.util.AdbShellExecutor
 import com.ufi_axis_core.util.AppLogger
@@ -130,6 +131,13 @@ class UpdateManager(
     private data class VersionManifest(
         // versionName 与旧字段 version 双名解析
         @JsonNames("versionName") val version: String? = null,
+        /**
+         * 内部版本号（2026-11-15 补）。
+         *
+         * 版本名相同、只抬 versionCode 的"同名重发"（v0.1.1 从 5 到 6）靠它才认得出；
+         * 旧清单没有这个字段 → null → 退回纯版本名比较。
+         */
+        @JsonNames("versionCode") val version_code: Int? = null,
         // 双名解析：新 camelCase（apkUrl/apkSha256/apkSize）与旧 snake_case（apk_url/sha256）均兼容
         @JsonNames("apkUrl") val apk_url: String? = null,
         @JsonNames("apkSha256") val sha256: String? = null,
@@ -316,8 +324,14 @@ class UpdateManager(
                 // sha256 必填：缺失即拒绝更新（防旧格式 / 防篡改）
                 val expectedSha = manifest.sha256 ?: throw NeedPushException("版本清单缺少 sha256 字段（旧格式已拒绝更新）")
 
-                // ② 版本比对（禁止降级）
-                if (compareVersions(latest, current) <= 0) {
+                // ② 版本比对（版本名优先、同名看 versionCode；禁止降级）
+                val upToDate = !hasUpdate(
+                    latestName = latest,
+                    latestCode = manifest.version_code ?: 0,
+                    currentName = current,
+                    currentCode = BuildConfig.VERSION_CODE,
+                )
+                if (upToDate) {
                     status = UpdateStatus(State.IDLE, 0, "已是最新版本", current, latest)
                     return@launch
                 }
