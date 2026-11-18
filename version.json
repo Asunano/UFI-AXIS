@@ -41,10 +41,10 @@
     },
     "cloudflared": {
       "upstream": "cloudflare/cloudflared",
-      "version": "2026.11.0",
-      "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.11.0/cloudflared-linux-arm64",
-      "sha256": "abe54a006acf9faf2d19ee9d953cb0d0804e92f59c5382a162e57b84d086f56f",
-      "size": 37668707,
+      "version": "2026.11.1",
+      "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.11.1/cloudflared-linux-arm64",
+      "sha256": "b155cec3e48e489cfb8e5c602769fb8c771083018d8881d68b4d18a791567c5a",
+      "size": 37818397,
       "archive": "raw",
       "entry": ""
     }
@@ -425,10 +425,10 @@
       "homepage": "https://github.com/jeessy2/ddns-go",
       "license": "MIT",
       "artifact": {
-        "version": "6.17.8",
-        "url": "https://github.com/jeessy2/ddns-go/releases/download/v6.17.8/ddns-go_6.17.8_android_arm64.tar.gz",
-        "sha256": "2dbeb80bb22def3bb2a00575dea5ed6c00b5fa5dacb0dd180eaf8eb52a51dc5a",
-        "size": 4541597,
+        "version": "6.17.9",
+        "url": "https://github.com/jeessy2/ddns-go/releases/download/v6.17.9/ddns-go_6.17.9_android_arm64.tar.gz",
+        "sha256": "58e1cf82eb8ad36f93ef3d13cb8193edba73d920855006b7bae3bdd603a33f08",
+        "size": 4542837,
         "archive": "tar.gz",
         "entry": "ddns-go",
         "abi": "arm64-v8a",
